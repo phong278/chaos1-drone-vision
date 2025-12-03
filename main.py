@@ -224,10 +224,16 @@ class FrameProcessor(Thread):
     
     def run(self):
         """Process frames from queue"""
+        # Wait for first frame before starting processing
+        time.sleep(0.1)
+        
         while self.running.is_set():
             try:
                 frame_id, frame = self.input_queue.get(timeout=0.1)
-                
+            except:
+                continue  # No frame available, try again
+            
+            try:
                 # Resize for faster inference if configured
                 if self.config["performance"]["resize_input"]:
                     target_size = self.config["performance"]["input_size"]
@@ -253,6 +259,10 @@ class FrameProcessor(Thread):
             except Exception as e:
                 if self.running.is_set():
                     print(f"Processor error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Don't spam errors
+                    time.sleep(0.5)
     
     def submit_frame(self, frame_id, frame):
         """Submit frame for processing"""
@@ -306,15 +316,18 @@ class DetectionSystem:
         elif self.config["performance"]["mode"] == "power_saving":
             self.apply_power_saving_settings()
         
-        # Initialize system
+        # Initialize system FIRST
         self.setup_logging()
         self.init_system()
         
-        # Initialize threaded processor
+        # Initialize threaded processor AFTER model and camera are ready
         self.processor = None
         if self.config["performance"]["use_threading"]:
+            self.log_message("Starting threaded processor...")
             self.processor = FrameProcessor(self.model, self.config)
             self.processor.start()
+            time.sleep(0.2)  # Give thread time to initialize
+            self.log_message("Threaded processor started successfully")
         
         self.pending_frame_id = 0
         self.last_results = None
@@ -404,7 +417,13 @@ class DetectionSystem:
         """Initialize camera with optimal settings for Pi"""
         self.log_message(f"Initializing camera {self.config['camera']['device_id']}")
         
-        backend = self.config['camera']['backend'] if self.platform == "raspberry" else cv2.CAP_ANY
+        # Use appropriate backend based on platform
+        if self.platform == "raspberry":
+            backend = self.config['camera']['backend']
+        else:
+            backend = cv2.CAP_ANY  # Auto-detect on non-Pi systems
+            self.log_message(f"Non-Pi platform detected ({self.platform}), using CAP_ANY backend")
+        
         self.cap = cv2.VideoCapture(self.config['camera']['device_id'], backend)
         
         if not self.cap.isOpened():
@@ -419,9 +438,12 @@ class DetectionSystem:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config['camera']['height'])
         self.cap.set(cv2.CAP_PROP_FPS, self.config['camera']['fps'])
         
-        # Disable auto-exposure for consistent performance
+        # Disable auto-exposure for consistent performance (Pi only)
         if self.platform == "raspberry":
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            try:
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            except:
+                pass  # Ignore if not supported
         
         # Get actual properties
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -431,7 +453,7 @@ class DetectionSystem:
         self.center_x = self.frame_width // 2
         self.center_y = self.frame_height // 2
         
-        self.log_message(f"Camera: {self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f} FPS")
+        self.log_message(f"Camera initialized: {self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f} FPS")
     
     def get_color(self, label):
         """Get color for a label based on color scheme"""
