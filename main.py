@@ -3,21 +3,33 @@ import sys
 import signal
 import time
 import os
+import shutil
 from datetime import datetime
+from pathlib import Path
+from collections import deque
+from threading import Thread, Lock, Event
+from queue import Queue, Full
+import numpy as np
 from ultralytics import YOLO
-from ultralytics.utils import LOGGER
 
 # ==================== CONFIGURATION ====================
 CONFIG = {
     "system": {
         "platform": "auto",  # "auto", "windows", "linux", "raspberry"
         "log_to_file": True,
-        "data_folder": "detection_data"
+        "data_folder": "detection_data",
+        "max_storage_mb": 500,  # Maximum storage for images in MB
+        "thermal_throttle": True,  # Enable thermal management
+        "temp_threshold": 75,  # Temperature threshold in Celsius
     },
     "performance": {
-        "mode": "balanced",  # "balanced", "high_performance"
-        "throttle_fps": 30,  # Target FPS, will add sleep to not exceed this
-        "frame_skip": 0,  # Number of frames to skip between processing
+        "mode": "balanced",  # "balanced", "high_performance", "power_saving"
+        "throttle_fps": 15,  # Target FPS for Pi (reduced from 30)
+        "frame_skip": 1,  # Skip every other frame
+        "resize_input": True,  # Resize input for faster processing
+        "input_size": (416, 416),  # Smaller input size for YOLO
+        "use_threading": True,  # Enable multithreaded processing
+        "frame_buffer_size": 2,  # Small buffer to prevent memory buildup
     },
     "camera": {
         "device_id": 0,
@@ -26,52 +38,68 @@ CONFIG = {
         "fps": 30,
         "flip_horizontal": False,
         "flip_vertical": False,
+        "backend": cv2.CAP_V4L2,  # V4L2 for Raspberry Pi
+        "buffer_size": 1,  # Minimize camera buffer
     },
     "detection": {
-        "model": "yolov8n.pt",
+        "model": "yolov8n.pt",  # Nano model for Pi
         "confidence": 0.5,
         "iou_threshold": 0.5,
-        "track_objects": True,  # Enable object tracking between frames
-        # Expanded object classes to detect
-        "classes": {
-            "electronics": ["cell phone", "laptop", "mouse", "keyboard", "remote"],
-            "people": ["person"],
-            "vehicles": ["car", "motorcycle", "bicycle", "bus", "truck"],
-            "animals": ["cat", "dog", "bird"],
-            "furniture": ["chair", "dining table", "bed", "couch"],
-            "kitchen": ["bottle", "cup", "bowl", "fork", "knife", "spoon"],
-            "sports": ["sports ball", "baseball bat", "baseball glove", 
-                      "tennis racket", "skateboard"],
-        }
+        "track_objects": True,
+        "use_half_precision": True,  # FP16 for speed (if supported)
+        # COCO dataset classes (80 classes)
+        "priority_classes": {
+            "high": ["person", "cell phone", "laptop", "cat", "dog"],
+            "medium": ["car", "motorcycle", "bicycle", "bus", "truck", "bottle", "cup"],
+            "low": ["chair", "couch", "bed", "dining table", "tv", "keyboard", "mouse"]
+        },
     },
     "tracking": {
-        "priority_order": ["cell phone", "person", "laptop", "cat", "dog"],
-        "auto_focus": True,  # Automatically focus on highest priority object
+        "priority_order": ["person", "cell phone", "laptop", "cat", "dog"],
+        "auto_focus": True,
         "deadzone": 50,
-        "history_length": 10,  # Number of past positions to track
+        "history_length": 5,  # Reduced for memory
+        "smoothing": 0.3,  # Smooth tracking movements
     },
     "visualization": {
         "show_fps": True,
-        "show_center": True,
+        "show_center": False,  # Disable for performance
         "show_bbox": True,
-        "show_trail": True,  # Show movement trail
-        "show_distance": False,  # Estimate distance (requires calibration)
-        "color_scheme": "vibrant",  # "vibrant", "pastel", "mono"
-        "window_scale": 1.0,  # Scale window size
+        "show_trail": False,  # Disable for performance
+        "show_distance": False,
+        "color_scheme": "vibrant",
+        "window_scale": 1.0,
+        "render_every_n": 1,  # Render every Nth frame
     },
     "output": {
         "console_log": False,
-        "file_log": False,
-        "save_detections": True,  # Save detection images
+        "file_log": True,
+        "save_detections": True,
         "save_interval": 30,  # Save every 30 seconds
+        "save_on_detection": False,  # Save only when objects detected
+        "image_quality": 85,  # JPEG quality (0-100)
     }
 }
+
+# ==================== COCO CLASSES ====================
+COCO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+    'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+    'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator',
+    'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
 
 # ==================== COLOR SCHEMES ====================
 COLOR_SCHEMES = {
     "vibrant": {
-        "cell phone": (0, 255, 0),      # Green
         "person": (255, 0, 0),          # Blue
+        "cell phone": (0, 255, 0),      # Green
         "laptop": (255, 255, 0),        # Cyan
         "cat": (255, 0, 255),           # Magenta
         "dog": (0, 255, 255),           # Yellow
@@ -79,16 +107,173 @@ COLOR_SCHEMES = {
         "bottle": (128, 0, 128),        # Purple
         "chair": (0, 128, 128),         # Teal
         "default": (200, 200, 200)      # Gray
-    },
-    "pastel": {
-        "cell phone": (100, 230, 100),  # Light Green
-        "person": (100, 100, 230),      # Light Blue
-        "default": (180, 180, 180)      # Light Gray
     }
 }
 
-# ==================== INITIALIZATION ====================
+# ==================== STORAGE MANAGER ====================
+class StorageManager:
+    """Manages image storage with automatic cleanup"""
+    
+    def __init__(self, folder_path, max_size_mb):
+        self.folder_path = Path(folder_path)
+        self.max_size_bytes = max_size_mb * 1024 * 1024
+        self.folder_path.mkdir(exist_ok=True)
+        self.lock = Lock()
+    
+    def get_folder_size(self):
+        """Calculate total size of folder in bytes"""
+        total = 0
+        for file in self.folder_path.glob("detection_*.jpg"):
+            total += file.stat().st_size
+        return total
+    
+    def cleanup_old_files(self):
+        """Remove oldest files if storage exceeds limit"""
+        with self.lock:
+            current_size = self.get_folder_size()
+            
+            if current_size <= self.max_size_bytes:
+                return
+            
+            # Get all detection images sorted by modification time
+            files = sorted(
+                self.folder_path.glob("detection_*.jpg"),
+                key=lambda x: x.stat().st_mtime
+            )
+            
+            # Delete oldest files until under limit
+            for file in files:
+                if current_size <= self.max_size_bytes * 0.8:  # 80% threshold
+                    break
+                try:
+                    file_size = file.stat().st_size
+                    file.unlink()
+                    current_size -= file_size
+                except Exception as e:
+                    print(f"Error deleting {file}: {e}")
+    
+    def save_image(self, image, prefix="detection"):
+        """Save image with automatic cleanup"""
+        self.cleanup_old_files()
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = self.folder_path / f"{prefix}_{timestamp}.jpg"
+        
+        with self.lock:
+            cv2.imwrite(str(filename), image, 
+                       [cv2.IMWRITE_JPEG_QUALITY, CONFIG["output"]["image_quality"]])
+        
+        return filename
 
+# ==================== THERMAL MANAGER ====================
+class ThermalManager:
+    """Monitor and manage Pi temperature"""
+    
+    def __init__(self, threshold=75):
+        self.threshold = threshold
+        self.is_raspberry = self._is_raspberry_pi()
+        self.throttled = False
+    
+    def _is_raspberry_pi(self):
+        """Check if running on Raspberry Pi"""
+        try:
+            with open('/proc/device-tree/model', 'r') as f:
+                return 'raspberry' in f.read().lower()
+        except:
+            return False
+    
+    def get_temperature(self):
+        """Get CPU temperature"""
+        if not self.is_raspberry:
+            return None
+        
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                temp = float(f.read()) / 1000.0
+                return temp
+        except:
+            return None
+    
+    def should_throttle(self):
+        """Check if system should throttle due to temperature"""
+        temp = self.get_temperature()
+        if temp is None:
+            return False
+        
+        if temp > self.threshold:
+            self.throttled = True
+            return True
+        elif temp < self.threshold - 5:  # Hysteresis
+            self.throttled = False
+            return False
+        
+        return self.throttled
+
+# ==================== FRAME PROCESSOR ====================
+class FrameProcessor(Thread):
+    """Threaded frame processor for async inference"""
+    
+    def __init__(self, model, config):
+        super().__init__(daemon=True)
+        self.model = model
+        self.config = config
+        self.input_queue = Queue(maxsize=config["performance"]["frame_buffer_size"])
+        self.output_queue = Queue(maxsize=config["performance"]["frame_buffer_size"])
+        self.running = Event()
+        self.running.set()
+    
+    def run(self):
+        """Process frames from queue"""
+        while self.running.is_set():
+            try:
+                frame_id, frame = self.input_queue.get(timeout=0.1)
+                
+                # Resize for faster inference if configured
+                if self.config["performance"]["resize_input"]:
+                    target_size = self.config["performance"]["input_size"]
+                    resized = cv2.resize(frame, target_size)
+                else:
+                    resized = frame
+                
+                # Run inference
+                results = self.model(
+                    resized,
+                    conf=self.config['detection']['confidence'],
+                    iou=self.config['detection']['iou_threshold'],
+                    verbose=False,
+                    half=self.config['detection']['use_half_precision']
+                )
+                
+                # Put result in output queue
+                try:
+                    self.output_queue.put((frame_id, results), block=False)
+                except Full:
+                    pass  # Drop frame if queue full
+                    
+            except Exception as e:
+                if self.running.is_set():
+                    print(f"Processor error: {e}")
+    
+    def submit_frame(self, frame_id, frame):
+        """Submit frame for processing"""
+        try:
+            self.input_queue.put((frame_id, frame), block=False)
+            return True
+        except Full:
+            return False
+    
+    def get_result(self, timeout=0.001):
+        """Get processed result"""
+        try:
+            return self.output_queue.get(timeout=timeout)
+        except:
+            return None
+    
+    def stop(self):
+        """Stop processor thread"""
+        self.running.clear()
+
+# ==================== DETECTION SYSTEM ====================
 class DetectionSystem:
     def __init__(self, config):
         self.config = config
@@ -96,34 +281,59 @@ class DetectionSystem:
         self.cap = None
         self.detection_history = {}
         self.frame_count = 0
+        self.processed_count = 0
         self.start_time = time.time()
         self.last_save_time = time.time()
         self.focus_object = None
         self.platform = self.detect_platform()
+        self.fps = 0
+        self.processing_times = deque(maxlen=30)
+        
+        # Initialize managers
+        self.storage_manager = StorageManager(
+            self.config["system"]["data_folder"],
+            self.config["system"]["max_storage_mb"]
+        )
+        
+        self.thermal_manager = ThermalManager(
+            self.config["system"]["temp_threshold"]
+        ) if self.config["system"]["thermal_throttle"] else None
         
         # Performance mode adjustments
         self.is_high_performance = self.config["performance"]["mode"] == "high_performance"
         if self.is_high_performance:
             self.apply_high_performance_settings()
-
-        # Initialize logging
-        self.setup_logging()
+        elif self.config["performance"]["mode"] == "power_saving":
+            self.apply_power_saving_settings()
         
         # Initialize system
+        self.setup_logging()
         self.init_system()
-    
+        
+        # Initialize threaded processor
+        self.processor = None
+        if self.config["performance"]["use_threading"]:
+            self.processor = FrameProcessor(self.model, self.config)
+            self.processor.start()
+        
+        self.pending_frame_id = 0
+        self.last_results = None
+
     def apply_high_performance_settings(self):
-        """Overrides config for high-performance mode."""
-        # Disable all visualization
-        for key in self.config["visualization"]:
-            self.config["visualization"][key] = False
-        
-        # Disable file output
+        """Optimize for maximum performance"""
+        self.config["performance"]["frame_skip"] = 2
+        self.config["performance"]["resize_input"] = True
+        self.config["visualization"]["show_trail"] = False
+        self.config["visualization"]["show_center"] = False
         self.config["output"]["save_detections"] = False
-        self.config["output"]["file_log"] = False
-        
-        # Disable tracking features that are not essential
         self.config["detection"]["track_objects"] = False
+
+    def apply_power_saving_settings(self):
+        """Optimize for power efficiency"""
+        self.config["performance"]["throttle_fps"] = 10
+        self.config["performance"]["frame_skip"] = 2
+        self.config["performance"]["resize_input"] = True
+        self.config["visualization"]["render_every_n"] = 2
 
     def detect_platform(self):
         """Detect the current platform"""
@@ -131,7 +341,6 @@ class DetectionSystem:
         system = platform.system().lower()
         
         if system == "linux":
-            # Check if Raspberry Pi
             try:
                 with open('/proc/device-tree/model', 'r') as f:
                     if 'raspberry' in f.read().lower():
@@ -148,14 +357,9 @@ class DetectionSystem:
     def setup_logging(self):
         """Setup logging system"""
         if self.config["system"]["log_to_file"]:
-            # Create data folder
-            data_folder = self.config["system"]["data_folder"]
-            if not os.path.exists(data_folder):
-                os.makedirs(data_folder)
-            
-            # Create log file with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.log_file = os.path.join(data_folder, f"detection_log_{timestamp}.txt")
+            self.log_file = Path(self.config["system"]["data_folder"]) / f"detection_log_{timestamp}.txt"
+            self.log_file.parent.mkdir(exist_ok=True)
             
             with open(self.log_file, 'w') as f:
                 f.write(f"Detection System Log - Started at {timestamp}\n")
@@ -171,7 +375,7 @@ class DetectionSystem:
         if self.config["output"]["console_log"]:
             print(formatted_msg)
         
-        if self.config["system"]["log_to_file"] and self.config["output"]["file_log"] and hasattr(self, 'log_file'):
+        if self.config["system"]["log_to_file"] and self.config["output"]["file_log"]:
             with open(self.log_file, 'a') as f:
                 f.write(formatted_msg + "\n")
     
@@ -183,7 +387,12 @@ class DetectionSystem:
         self.log_message(f"Loading model: {self.config['detection']['model']}")
         try:
             self.model = YOLO(self.config['detection']['model'])
-            self.log_message("Model loaded successfully")
+            
+            # Warm up model
+            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+            self.model(dummy, verbose=False)
+            
+            self.log_message("Model loaded and warmed up successfully")
         except Exception as e:
             self.log_message(f"Error loading model: {e}", "ERROR")
             sys.exit(1)
@@ -192,18 +401,27 @@ class DetectionSystem:
         self.init_camera()
     
     def init_camera(self):
-        """Initialize camera"""
+        """Initialize camera with optimal settings for Pi"""
         self.log_message(f"Initializing camera {self.config['camera']['device_id']}")
-        self.cap = cv2.VideoCapture(self.config['camera']['device_id'])
+        
+        backend = self.config['camera']['backend'] if self.platform == "raspberry" else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(self.config['camera']['device_id'], backend)
         
         if not self.cap.isOpened():
             self.log_message("Error: Could not open camera", "ERROR")
             sys.exit(1)
         
+        # Set camera buffer to minimum
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config['camera']['buffer_size'])
+        
         # Set camera properties
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config['camera']['width'])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config['camera']['height'])
         self.cap.set(cv2.CAP_PROP_FPS, self.config['camera']['fps'])
+        
+        # Disable auto-exposure for consistent performance
+        if self.platform == "raspberry":
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
         
         # Get actual properties
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -227,66 +445,23 @@ class DetectionSystem:
         if label in priority_order:
             base_priority = len(priority_order) - priority_order.index(label)
         else:
-            base_priority = 1
+            # Check priority classes
+            for level, classes in self.config['detection']['priority_classes'].items():
+                if label in classes:
+                    if level == "high":
+                        base_priority = 10
+                    elif level == "medium":
+                        base_priority = 5
+                    else:
+                        base_priority = 2
+                    break
+            else:
+                base_priority = 1
         
-        # Adjust by confidence
         return base_priority * confidence
     
-    def estimate_distance(self, box_height, known_height=15):
-        """Estimate distance to object (in cm, requires calibration)"""
-        focal_length = 500  # Example, calibrate this!
-        
-        if box_height > 0:
-            distance = (known_height * focal_length) / box_height
-            return distance
-        return None
-    
-    def control_servo(self, dx, dy):
-        """Calculate servo movements (for pan-tilt)"""
-        norm_dx = dx / (self.frame_width / 2)
-        norm_dy = dy / (self.frame_height / 2)
-        norm_dx = max(-1, min(1, norm_dx))
-        norm_dy = max(-1, min(1, norm_dy))
-        pan_angle = 90 + (norm_dx * 45)
-        tilt_angle = 90 + (norm_dy * 45)
-        
-        return pan_angle, tilt_angle
-    
-    def save_detection_image(self, frame, detections):
-        """Save detection image with metadata"""
-        if not self.config['output']['save_detections']:
-            return
-        
-        current_time = time.time()
-        if current_time - self.last_save_time >= self.config['output']['save_interval']:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = os.path.join(
-                self.config['system']['data_folder'],
-                f"detection_{timestamp}.jpg"
-            )
-            
-            if not self.is_high_performance:
-                cv2.putText(frame, timestamp, (10, self.frame_height - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            cv2.imwrite(filename, frame)
-            self.log_message(f"Saved detection image: {filename}")
-            self.last_save_time = current_time
-    
-    def process_frame(self, frame):
-        """Process a single frame"""
-        # Flip frame if configured
-        if self.config['camera']['flip_horizontal']:
-            frame = cv2.flip(frame, 1)
-        if self.config['camera']['flip_vertical']:
-            frame = cv2.flip(frame, 0)
-        
-        # Run inference
-        results = self.model(frame, 
-                           conf=self.config['detection']['confidence'],
-                           iou=self.config['detection']['iou_threshold'],
-                           verbose=False)
-        
+    def process_detections(self, frame, results):
+        """Process detection results"""
         current_detections = {}
         best_priority = 0
         best_object = None
@@ -297,16 +472,15 @@ class DetectionSystem:
                 label = self.model.names[cls_id]
                 conf = float(box.conf[0])
                 
-                found = False
-                for category in self.config['detection']['classes'].values():
-                    if label in category:
-                        found = True
-                        break
-                
-                if not found:
-                    continue
-                
                 x1, y1, x2, y2 = box.xyxy[0]
+                
+                # Scale coordinates back if input was resized
+                if self.config["performance"]["resize_input"]:
+                    scale_x = self.frame_width / self.config["performance"]["input_size"][0]
+                    scale_y = self.frame_height / self.config["performance"]["input_size"][1]
+                    x1, x2 = x1 * scale_x, x2 * scale_x
+                    y1, y2 = y1 * scale_y, y2 * scale_y
+                
                 obj_cx = int((x1 + x2) / 2)
                 obj_cy = int((y1 + y2) / 2)
                 
@@ -316,140 +490,223 @@ class DetectionSystem:
                     'label': label,
                     'confidence': conf,
                     'center': (obj_cx, obj_cy),
-                    'bbox': (x1, y1, x2, y2),
+                    'bbox': (int(x1), int(y1), int(x2), int(y2)),
                     'offset': (obj_cx - self.center_x, obj_cy - self.center_y),
                     'priority': priority
                 }
                 
+                # Track object history
                 if self.config['detection']['track_objects']:
                     if label not in self.detection_history:
-                        self.detection_history[label] = []
+                        self.detection_history[label] = deque(maxlen=self.config['tracking']['history_length'])
                     self.detection_history[label].append(detection_data)
-                    if len(self.detection_history[label]) > self.config['tracking']['history_length']:
-                        self.detection_history[label] = self.detection_history[label][-self.config['tracking']['history_length']:]
                 
-                current_detections[label] = detection_data
+                current_detections[f"{label}_{len(current_detections)}"] = detection_data
                 
                 if priority > best_priority:
                     best_priority = priority
                     best_object = detection_data
-                
-                if not self.is_high_performance:
-                    self.draw_detection(frame, detection_data)
         
+        # Update focus with smoothing
         if self.config['tracking']['auto_focus'] and best_object:
-            self.focus_object = best_object
-            pan_angle, tilt_angle = self.control_servo(
-                best_object['offset'][0], 
-                best_object['offset'][1]
-            )
+            if self.focus_object:
+                # Smooth transition
+                alpha = self.config['tracking']['smoothing']
+                old_x, old_y = self.focus_object['offset']
+                new_x, new_y = best_object['offset']
+                smooth_x = int(old_x * (1 - alpha) + new_x * alpha)
+                smooth_y = int(old_y * (1 - alpha) + new_y * alpha)
+                best_object['offset'] = (smooth_x, smooth_y)
             
-            if self.frame_count % 30 == 0:
-                self.log_message(
-                    f"Focus: {best_object['label']} "
-                    f"Pan: {pan_angle:.1f}°, Tilt: {tilt_angle:.1f}°"
-                )
+            self.focus_object = best_object
         
-        if not self.is_high_performance:
-            self.draw_overlay(frame, current_detections)
-        
-        self.save_detection_image(frame, current_detections)
-        
-        return frame, current_detections
+        return current_detections
     
-    def draw_detection(self, frame, detection):
-        """Draw a single detection on frame"""
-        label = detection['label']
-        conf = detection['confidence']
-        x1, y1, x2, y2 = detection['bbox']
-        color = self.get_color(label)
-        
-        if self.config['visualization']['show_bbox']:
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-        
-        label_text = f"{label} {conf:.2f}"
-        cv2.putText(frame, label_text, 
-                   (int(x1), int(y1) - 10 if y1 > 20 else int(y1) + 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
+    def draw_detections(self, frame, detections):
+        """Draw all detections on frame"""
+        for detection in detections.values():
+            label = detection['label']
+            conf = detection['confidence']
+            x1, y1, x2, y2 = detection['bbox']
+            color = self.get_color(label)
+            
+            if self.config['visualization']['show_bbox']:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            label_text = f"{label} {conf:.2f}"
+            cv2.putText(frame, label_text, 
+                       (x1, y1 - 10 if y1 > 20 else y1 + 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    
     def draw_overlay(self, frame, detections):
         """Draw overlay information"""
-        if self.config['visualization']['show_fps'] and hasattr(self, 'fps'):
+        if self.config['visualization']['show_fps']:
             fps_text = f"FPS: {self.fps:.1f}"
             cv2.putText(frame, fps_text, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
         obj_count = len(detections)
         count_text = f"Objects: {obj_count}"
-        cv2.putText(frame, count_text, (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(frame, count_text, (10, 55),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        # Show temperature if available
+        if self.thermal_manager:
+            temp = self.thermal_manager.get_temperature()
+            if temp:
+                temp_color = (0, 255, 0) if temp < 60 else (0, 255, 255) if temp < 70 else (0, 0, 255)
+                temp_text = f"Temp: {temp:.1f}C"
+                cv2.putText(frame, temp_text, (10, 80),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, temp_color, 2)
+    
+    def save_detection_image(self, frame, detections):
+        """Save detection image with metadata"""
+        if not self.config['output']['save_detections']:
+            return
+        
+        current_time = time.time()
+        should_save = current_time - self.last_save_time >= self.config['output']['save_interval']
+        
+        # Save on detection if configured
+        if self.config['output']['save_on_detection'] and len(detections) == 0:
+            should_save = False
+        
+        if should_save:
+            try:
+                filename = self.storage_manager.save_image(frame)
+                self.log_message(f"Saved: {filename.name}")
+                self.last_save_time = current_time
+            except Exception as e:
+                self.log_message(f"Error saving image: {e}", "ERROR")
     
     def run(self):
-        """Main run loop"""
+        """Main run loop with optimized threading"""
         self.log_message("Starting detection system...")
-        self.log_message("Press 'q' in the OpenCV window to quit.")
+        self.log_message("Press 'q' to quit.")
         
         fps_start_time = time.time()
         fps_frame_count = 0
         frame_skip_counter = 0
+        render_counter = 0
         
         target_frame_time = 1.0 / self.config['performance']['throttle_fps'] if self.config['performance']['throttle_fps'] > 0 else 0
 
-        while True:
-            frame_start_time = time.time()
-
-            # Read frame
-            ret, frame = self.cap.read()
-            if not ret:
-                self.log_message("Error reading frame or end of stream", "ERROR")
-                break
-            
-            self.frame_count += 1
-            
-            # Frame skipping logic
-            if frame_skip_counter > 0:
-                frame_skip_counter -= 1
-                # Still need to handle window events and delay
-                if not self.is_high_performance:
+        try:
+            while True:
+                loop_start = time.time()
+                
+                # Check thermal throttling
+                if self.thermal_manager and self.thermal_manager.should_throttle():
+                    time.sleep(0.5)
+                    continue
+                
+                # Read frame
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.log_message("Error reading frame", "ERROR")
+                    break
+                
+                self.frame_count += 1
+                
+                # Apply flips
+                if self.config['camera']['flip_horizontal']:
+                    frame = cv2.flip(frame, 1)
+                if self.config['camera']['flip_vertical']:
+                    frame = cv2.flip(frame, 0)
+                
+                # Frame skipping
+                if frame_skip_counter > 0:
+                    frame_skip_counter -= 1
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
-                time.sleep(target_frame_time / 2) # Sleep even on skipped frames
-                continue
-
-            frame_skip_counter = self.config['performance']['frame_skip']
-
-            # Process frame
-            processed_frame, detections = self.process_frame(frame)
-            
-            # Calculate FPS
-            fps_frame_count += 1
-            if time.time() - fps_start_time >= 1.0:
-                self.fps = fps_frame_count / (time.time() - fps_start_time)
-                fps_start_time = time.time()
-                fps_frame_count = 0
-            
-            # Display frame if not in high performance mode
-            if not self.is_high_performance:
-                window_name = "Multi-Object Detection System"
-                cv2.imshow(window_name, processed_frame)
-            
-            # Handle keyboard input
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                self.log_message("Quit requested by user")
-                break
-
-            # Throttle to target FPS
-            elapsed_time = time.time() - frame_start_time
-            sleep_time = target_frame_time - elapsed_time
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                    continue
+                
+                frame_skip_counter = self.config['performance']['frame_skip']
+                
+                # Process frame
+                process_start = time.time()
+                
+                if self.processor:
+                    # Threaded processing
+                    self.processor.submit_frame(self.pending_frame_id, frame.copy())
+                    self.pending_frame_id += 1
+                    
+                    # Get latest result
+                    result = self.processor.get_result()
+                    if result:
+                        _, results = result
+                        self.last_results = results
+                        self.processed_count += 1
+                    
+                    # Use last results if available
+                    if self.last_results:
+                        detections = self.process_detections(frame, self.last_results)
+                    else:
+                        detections = {}
+                else:
+                    # Synchronous processing
+                    if self.config["performance"]["resize_input"]:
+                        resized = cv2.resize(frame, self.config["performance"]["input_size"])
+                    else:
+                        resized = frame
+                    
+                    results = self.model(resized,
+                                       conf=self.config['detection']['confidence'],
+                                       iou=self.config['detection']['iou_threshold'],
+                                       verbose=False)
+                    
+                    detections = self.process_detections(frame, results)
+                    self.processed_count += 1
+                
+                process_time = time.time() - process_start
+                self.processing_times.append(process_time)
+                
+                # Render (possibly skipping frames)
+                should_render = render_counter % self.config['visualization']['render_every_n'] == 0
+                render_counter += 1
+                
+                if should_render and not self.is_high_performance:
+                    self.draw_detections(frame, detections)
+                    self.draw_overlay(frame, detections)
+                    cv2.imshow("Detection System", frame)
+                
+                # Save detections
+                self.save_detection_image(frame, detections)
+                
+                # Calculate FPS
+                fps_frame_count += 1
+                if time.time() - fps_start_time >= 1.0:
+                    self.fps = fps_frame_count / (time.time() - fps_start_time)
+                    fps_start_time = time.time()
+                    fps_frame_count = 0
+                    
+                    # Log stats periodically
+                    avg_process_time = sum(self.processing_times) / len(self.processing_times) if self.processing_times else 0
+                    self.log_message(
+                        f"FPS: {self.fps:.1f} | Proc: {avg_process_time*1000:.1f}ms | "
+                        f"Detections: {len(detections)}"
+                    )
+                
+                # Handle input
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                
+                # Throttle FPS
+                elapsed = time.time() - loop_start
+                sleep_time = target_frame_time - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
         
-        # Cleanup
-        self.cleanup()
+        finally:
+            self.cleanup()
     
     def cleanup(self):
         """Cleanup resources"""
         self.log_message("Shutting down...")
+        
+        if self.processor:
+            self.processor.stop()
+            self.processor.join(timeout=1.0)
         
         if self.cap:
             self.cap.release()
@@ -458,7 +715,12 @@ class DetectionSystem:
         
         runtime = time.time() - self.start_time
         self.log_message(f"System ran for {runtime:.1f} seconds")
-        self.log_message(f"Processed {self.frame_count} frames")
+        self.log_message(f"Captured: {self.frame_count} frames")
+        self.log_message(f"Processed: {self.processed_count} frames")
+        
+        if self.processed_count > 0:
+            avg_fps = self.processed_count / runtime
+            self.log_message(f"Average FPS: {avg_fps:.1f}")
 
 # ==================== MAIN EXECUTION ====================
 
@@ -470,6 +732,18 @@ def signal_handler(sig, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     
+    # Print startup banner
+    print("=" * 60)
+    print("  Multi-Object Detection System - Raspberry Pi Optimized")
+    print("=" * 60)
+    print(f"  Performance Mode: {CONFIG['performance']['mode']}")
+    print(f"  Target FPS: {CONFIG['performance']['throttle_fps']}")
+    print(f"  Model: {CONFIG['detection']['model']}")
+    print(f"  Max Storage: {CONFIG['system']['max_storage_mb']} MB")
+    print(f"  Threading: {'Enabled' if CONFIG['performance']['use_threading'] else 'Disabled'}")
+    print("=" * 60)
+    print()
+    
     try:
         system = DetectionSystem(CONFIG)
         system.run()
@@ -480,4 +754,6 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
     finally:
-        print("\nDetection system terminated.")
+        print("\n" + "=" * 60)
+        print("  Detection system terminated.")
+        print("=" * 60)
