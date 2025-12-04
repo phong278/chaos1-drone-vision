@@ -23,7 +23,7 @@ CONFIG = {
         "temp_threshold": 75,  # Temperature threshold in Celsius
     },
     "performance": {
-        "mode": "balanced",  # "balanced", "high_performance", "power_saving"
+        "mode": "power_saving",  # "balanced", "high_performance", "power_saving"
         "throttle_fps": 15,  # Target FPS for Pi (reduced from 30)
         "frame_skip": 1,  # Skip every other frame
         "resize_input": True,  # Resize input for faster processing
