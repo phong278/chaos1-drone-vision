@@ -1,25 +1,12 @@
 # ---------- Raspberry Pi Python 3.13 Compatible ----------
 
-# Numpy that supports Python 3.13
-numpy==2.1.2
-
-# Pillow OK on Pi
-pillow==10.0.0
-
-# Requests + YAML (safe)
+numpy==1.26.0
+pillow==10.4.0
 requests==2.31.0
 PyYAML==6.0.2
 
-# OpenCV (from piwheels, compatible with 3.13)
-opencv-python-headless==4.8.1.78
+opencv-python-headless==4.9.0.80
 
-# PyTorch for Python 3.13 (Pi wheels exist for 3.11; 3.13 is TOO NEW)
-# → So we REMOVE torch + torchvision
-# YOLOv8 will fall back to ONNXRuntime or CPU-only modes
-# REMOVE THESE:
-# torch
-# torchvision
-
-# YOLOv8 — latest version supports Python 3.13
+# CPU-only YOLOv8 (Torch removed)
 ultralytics==8.2.89
 
