@@ -1,0 +1,21 @@
+# ---------- Raspberry Pi Dependencies (ARM64 Compatible) ----------
+
+# Core numeric computation
+numpy==1.24.3
+
+# OpenCV (headless works best on Pi, avoids GUI + GTK issues)
+opencv-python-headless
+
+# PyTorch for Raspberry Pi (CPU-only)
+# The extra-index-url MUST come BEFORE torch/torchvision
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+
+# YOLOv8 (ultralytics)
+ultralytics==8.0.196
+
+# Recommended utilities
+PyYAML==6.0.2
+requests==2.31.0
+pillow==10.0.0
