@@ -1,7 +1,7 @@
 # ---------- Raspberry Pi Python 3.13 Compatible ----------
 
 # Numpy that supports Python 3.13
-numpy==1.26.4
+numpy==2.1.2
 
 # Pillow OK on Pi
 pillow==10.0.0
