@@ -3,33 +3,37 @@ import sys
 import signal
 import time
 import os
-import shutil
 from datetime import datetime
 from pathlib import Path
 from collections import deque
 from threading import Thread, Lock, Event
 from queue import Queue, Full
 import numpy as np
-from ultralytics import YOLO
+
+# Try to import TensorFlow Lite
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    import tensorflow.lite as tflite
 
 # ==================== CONFIGURATION ====================
 CONFIG = {
     "system": {
-        "platform": "auto",  # "auto", "windows", "linux", "raspberry"
+        "platform": "auto",
         "log_to_file": True,
         "data_folder": "detection_data",
-        "max_storage_mb": 500,  # Maximum storage for images in MB
-        "thermal_throttle": True,  # Enable thermal management
-        "temp_threshold": 75,  # Temperature threshold in Celsius
+        "max_storage_mb": 500,
+        "thermal_throttle": True,
+        "temp_threshold": 70,  # Lower for Pi 3
     },
     "performance": {
-        "mode": "power_saving",  # "balanced", "high_performance", "power_saving"
-        "throttle_fps": 15,  # Target FPS for Pi (reduced from 30)
-        "frame_skip": 1,  # Skip every other frame
-        "resize_input": True,  # Resize input for faster processing
-        "input_size": (416, 416),  # Smaller input size for YOLO
-        "use_threading": True,  # Enable multithreaded processing
-        "frame_buffer_size": 2,  # Small buffer to prevent memory buildup
+        "mode": "power_saving",  # Pi 3 needs power saving
+        "throttle_fps": 8,  # Lower FPS for Pi 3
+        "frame_skip": 2,  # Skip more frames
+        "resize_input": True,
+        "input_size": (300, 300),  # MobileNet SSD uses 300x300
+        "use_threading": False,  # Disable threading on Pi 3 (GIL overhead)
+        "frame_buffer_size": 1,
     },
     "camera": {
         "device_id": 0,
@@ -38,16 +42,14 @@ CONFIG = {
         "fps": 30,
         "flip_horizontal": False,
         "flip_vertical": False,
-        "backend": cv2.CAP_V4L2,  # V4L2 for Raspberry Pi
-        "buffer_size": 1,  # Minimize camera buffer
+        "backend": cv2.CAP_V4L2,
+        "buffer_size": 1,
     },
     "detection": {
-        "model": "yolov8n.pt",  # Nano model for Pi
+        "model": "detect.tflite",  # TFLite model
+        "labels": "labelmap.txt",  # COCO labels
         "confidence": 0.5,
-        "iou_threshold": 0.5,
-        "track_objects": True,
-        "use_half_precision": True,  # FP16 for speed (if supported)
-        # COCO dataset classes (80 classes)
+        "track_objects": False,  # Disable tracking for performance
         "priority_classes": {
             "high": ["person", "cell phone", "laptop", "cat", "dog"],
             "medium": ["car", "motorcycle", "bicycle", "bus", "truck", "bottle", "cup"],
@@ -56,28 +58,23 @@ CONFIG = {
     },
     "tracking": {
         "priority_order": ["person", "cell phone", "laptop", "cat", "dog"],
-        "auto_focus": True,
-        "deadzone": 50,
-        "history_length": 5,  # Reduced for memory
-        "smoothing": 0.3,  # Smooth tracking movements
+        "auto_focus": False,  # Disable for performance
+        "history_length": 3,
     },
     "visualization": {
         "show_fps": True,
-        "show_center": False,  # Disable for performance
         "show_bbox": True,
-        "show_trail": False,  # Disable for performance
-        "show_distance": False,
+        "show_center": False,
         "color_scheme": "vibrant",
-        "window_scale": 1.0,
-        "render_every_n": 1,  # Render every Nth frame
+        "render_every_n": 1,
     },
     "output": {
         "console_log": False,
         "file_log": True,
         "save_detections": True,
-        "save_interval": 30,  # Save every 30 seconds
-        "save_on_detection": False,  # Save only when objects detected
-        "image_quality": 85,  # JPEG quality (0-100)
+        "save_interval": 60,  # Save less frequently
+        "save_on_detection": True,  # Only save when objects detected
+        "image_quality": 75,  # Lower quality to save space
     }
 }
 
@@ -98,15 +95,15 @@ COCO_CLASSES = [
 # ==================== COLOR SCHEMES ====================
 COLOR_SCHEMES = {
     "vibrant": {
-        "person": (255, 0, 0),          # Blue
-        "cell phone": (0, 255, 0),      # Green
-        "laptop": (255, 255, 0),        # Cyan
-        "cat": (255, 0, 255),           # Magenta
-        "dog": (0, 255, 255),           # Yellow
-        "car": (255, 165, 0),           # Orange
-        "bottle": (128, 0, 128),        # Purple
-        "chair": (0, 128, 128),         # Teal
-        "default": (200, 200, 200)      # Gray
+        "person": (255, 0, 0),
+        "cell phone": (0, 255, 0),
+        "laptop": (255, 255, 0),
+        "cat": (255, 0, 255),
+        "dog": (0, 255, 255),
+        "car": (255, 165, 0),
+        "bottle": (128, 0, 128),
+        "chair": (0, 128, 128),
+        "default": (200, 200, 200)
     }
 }
 
@@ -124,7 +121,10 @@ class StorageManager:
         """Calculate total size of folder in bytes"""
         total = 0
         for file in self.folder_path.glob("detection_*.jpg"):
-            total += file.stat().st_size
+            try:
+                total += file.stat().st_size
+            except:
+                pass
         return total
     
     def cleanup_old_files(self):
@@ -135,15 +135,13 @@ class StorageManager:
             if current_size <= self.max_size_bytes:
                 return
             
-            # Get all detection images sorted by modification time
             files = sorted(
                 self.folder_path.glob("detection_*.jpg"),
                 key=lambda x: x.stat().st_mtime
             )
             
-            # Delete oldest files until under limit
             for file in files:
-                if current_size <= self.max_size_bytes * 0.8:  # 80% threshold
+                if current_size <= self.max_size_bytes * 0.8:
                     break
                 try:
                     file_size = file.stat().st_size
@@ -169,7 +167,7 @@ class StorageManager:
 class ThermalManager:
     """Monitor and manage Pi temperature"""
     
-    def __init__(self, threshold=75):
+    def __init__(self, threshold=70):
         self.threshold = threshold
         self.is_raspberry = self._is_raspberry_pi()
         self.throttled = False
@@ -203,101 +201,70 @@ class ThermalManager:
         if temp > self.threshold:
             self.throttled = True
             return True
-        elif temp < self.threshold - 5:  # Hysteresis
+        elif temp < self.threshold - 5:
             self.throttled = False
             return False
         
         return self.throttled
 
-# ==================== FRAME PROCESSOR ====================
-class FrameProcessor(Thread):
-    """Threaded frame processor for async inference"""
+# ==================== MODEL DOWNLOADER ====================
+class ModelDownloader:
+    """Download TensorFlow Lite models"""
     
-    def __init__(self, model, config):
-        super().__init__(daemon=True)
-        self.model = model
-        self.config = config
-        self.input_queue = Queue(maxsize=config["performance"]["frame_buffer_size"])
-        self.output_queue = Queue(maxsize=config["performance"]["frame_buffer_size"])
-        self.running = Event()
-        self.running.set()
-    
-    def run(self):
-        """Process frames from queue"""
-        # Wait for first frame before starting processing
-        time.sleep(0.1)
+    @staticmethod
+    def download_model():
+        """Download MobileNet SSD TFLite model and labels"""
+        import urllib.request
         
-        while self.running.is_set():
-            try:
-                frame_id, frame = self.input_queue.get(timeout=0.1)
-            except:
-                continue  # No frame available, try again
+        model_url = "https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip"
+        
+        print("Downloading MobileNet SSD model (4MB)...")
+        
+        try:
+            # Download model
+            import zipfile
+            import io
             
-            try:
-                # Resize for faster inference if configured
-                if self.config["performance"]["resize_input"]:
-                    target_size = self.config["performance"]["input_size"]
-                    resized = cv2.resize(frame, target_size)
-                else:
-                    resized = frame
-                
-                # Run inference
-                results = self.model(
-                    resized,
-                    conf=self.config['detection']['confidence'],
-                    iou=self.config['detection']['iou_threshold'],
-                    verbose=False,
-                    half=self.config['detection']['use_half_precision']
-                )
-                
-                # Put result in output queue
-                try:
-                    self.output_queue.put((frame_id, results), block=False)
-                except Full:
-                    pass  # Drop frame if queue full
-                    
-            except Exception as e:
-                if self.running.is_set():
-                    print(f"Processor error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # Don't spam errors
-                    time.sleep(0.5)
-    
-    def submit_frame(self, frame_id, frame):
-        """Submit frame for processing"""
-        try:
-            self.input_queue.put((frame_id, frame), block=False)
+            response = urllib.request.urlopen(model_url)
+            zip_data = response.read()
+            
+            # Extract
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zip_ref:
+                zip_ref.extractall(".")
+            
+            # Rename files
+            if os.path.exists("detect.tflite"):
+                print("✅ Model downloaded: detect.tflite")
+            
+            if os.path.exists("labelmap.txt"):
+                print("✅ Labels downloaded: labelmap.txt")
+            
             return True
-        except Full:
+            
+        except Exception as e:
+            print(f"❌ Error downloading model: {e}")
+            print("\nManual download instructions:")
+            print("1. Download: https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip")
+            print("2. Extract detect.tflite and labelmap.txt to current directory")
             return False
-    
-    def get_result(self, timeout=0.001):
-        """Get processed result"""
-        try:
-            return self.output_queue.get(timeout=timeout)
-        except:
-            return None
-    
-    def stop(self):
-        """Stop processor thread"""
-        self.running.clear()
 
 # ==================== DETECTION SYSTEM ====================
 class DetectionSystem:
     def __init__(self, config):
         self.config = config
-        self.model = None
+        self.interpreter = None
+        self.input_details = None
+        self.output_details = None
         self.cap = None
         self.detection_history = {}
         self.frame_count = 0
         self.processed_count = 0
         self.start_time = time.time()
         self.last_save_time = time.time()
-        self.focus_object = None
         self.platform = self.detect_platform()
         self.fps = 0
         self.processing_times = deque(maxlen=30)
+        self.labels = []
         
         # Initialize managers
         self.storage_manager = StorageManager(
@@ -309,44 +276,9 @@ class DetectionSystem:
             self.config["system"]["temp_threshold"]
         ) if self.config["system"]["thermal_throttle"] else None
         
-        # Performance mode adjustments
-        self.is_high_performance = self.config["performance"]["mode"] == "high_performance"
-        if self.is_high_performance:
-            self.apply_high_performance_settings()
-        elif self.config["performance"]["mode"] == "power_saving":
-            self.apply_power_saving_settings()
-        
-        # Initialize system FIRST
+        # Initialize system
         self.setup_logging()
         self.init_system()
-        
-        # Initialize threaded processor AFTER model and camera are ready
-        self.processor = None
-        if self.config["performance"]["use_threading"]:
-            self.log_message("Starting threaded processor...")
-            self.processor = FrameProcessor(self.model, self.config)
-            self.processor.start()
-            time.sleep(0.2)  # Give thread time to initialize
-            self.log_message("Threaded processor started successfully")
-        
-        self.pending_frame_id = 0
-        self.last_results = None
-
-    def apply_high_performance_settings(self):
-        """Optimize for maximum performance"""
-        self.config["performance"]["frame_skip"] = 2
-        self.config["performance"]["resize_input"] = True
-        self.config["visualization"]["show_trail"] = False
-        self.config["visualization"]["show_center"] = False
-        self.config["output"]["save_detections"] = False
-        self.config["detection"]["track_objects"] = False
-
-    def apply_power_saving_settings(self):
-        """Optimize for power efficiency"""
-        self.config["performance"]["throttle_fps"] = 10
-        self.config["performance"]["frame_skip"] = 2
-        self.config["performance"]["resize_input"] = True
-        self.config["visualization"]["render_every_n"] = 2
 
     def detect_platform(self):
         """Detect the current platform"""
@@ -392,20 +324,59 @@ class DetectionSystem:
             with open(self.log_file, 'a') as f:
                 f.write(formatted_msg + "\n")
     
+    def load_labels(self):
+        """Load COCO labels"""
+        label_file = self.config['detection']['labels']
+        
+        if os.path.exists(label_file):
+            with open(label_file, 'r') as f:
+                self.labels = [line.strip() for line in f.readlines()]
+            
+            # Remove index prefix if present (e.g., "0 person" -> "person")
+            self.labels = [label.split(' ', 1)[-1] if ' ' in label else label for label in self.labels]
+            
+            self.log_message(f"Loaded {len(self.labels)} labels")
+        else:
+            self.log_message("Label file not found, using default COCO classes", "WARNING")
+            self.labels = COCO_CLASSES
+    
     def init_system(self):
         """Initialize the detection system"""
         self.log_message(f"Initializing on platform: {self.platform}")
         
-        # Load model
-        self.log_message(f"Loading model: {self.config['detection']['model']}")
+        # Check if model exists
+        model_path = self.config['detection']['model']
+        if not os.path.exists(model_path):
+            self.log_message(f"Model not found: {model_path}", "WARNING")
+            self.log_message("Attempting to download model...")
+            
+            if not ModelDownloader.download_model():
+                self.log_message("Failed to download model", "ERROR")
+                sys.exit(1)
+        
+        # Load labels
+        self.load_labels()
+        
+        # Load TFLite model
+        self.log_message(f"Loading TFLite model: {model_path}")
         try:
-            self.model = YOLO(self.config['detection']['model'])
+            self.interpreter = tflite.Interpreter(model_path=model_path)
+            self.interpreter.allocate_tensors()
+            
+            self.input_details = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+            
+            # Get input shape
+            input_shape = self.input_details[0]['shape']
+            self.log_message(f"Model input shape: {input_shape}")
             
             # Warm up model
-            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-            self.model(dummy, verbose=False)
+            dummy_input = np.zeros(input_shape, dtype=np.uint8)
+            self.interpreter.set_tensor(self.input_details[0]['index'], dummy_input)
+            self.interpreter.invoke()
             
             self.log_message("Model loaded and warmed up successfully")
+            
         except Exception as e:
             self.log_message(f"Error loading model: {e}", "ERROR")
             sys.exit(1)
@@ -414,14 +385,13 @@ class DetectionSystem:
         self.init_camera()
     
     def init_camera(self):
-        """Initialize camera with optimal settings for Pi"""
+        """Initialize camera"""
         self.log_message(f"Initializing camera {self.config['camera']['device_id']}")
         
-        # Use appropriate backend based on platform
         if self.platform == "raspberry":
             backend = self.config['camera']['backend']
         else:
-            backend = cv2.CAP_ANY  # Auto-detect on non-Pi systems
+            backend = cv2.CAP_ANY
             self.log_message(f"Non-Pi platform detected ({self.platform}), using CAP_ANY backend")
         
         self.cap = cv2.VideoCapture(self.config['camera']['device_id'], backend)
@@ -430,22 +400,11 @@ class DetectionSystem:
             self.log_message("Error: Could not open camera", "ERROR")
             sys.exit(1)
         
-        # Set camera buffer to minimum
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.config['camera']['buffer_size'])
-        
-        # Set camera properties
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config['camera']['width'])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config['camera']['height'])
         self.cap.set(cv2.CAP_PROP_FPS, self.config['camera']['fps'])
         
-        # Disable auto-exposure for consistent performance (Pi only)
-        if self.platform == "raspberry":
-            try:
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-            except:
-                pass  # Ignore if not supported
-        
-        # Get actual properties
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.frame_fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -456,91 +415,74 @@ class DetectionSystem:
         self.log_message(f"Camera initialized: {self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f} FPS")
     
     def get_color(self, label):
-        """Get color for a label based on color scheme"""
+        """Get color for a label"""
         scheme = COLOR_SCHEMES.get(self.config['visualization']['color_scheme'], COLOR_SCHEMES['vibrant'])
         return scheme.get(label, scheme['default'])
     
-    def calculate_priority(self, label, confidence):
-        """Calculate priority score for an object"""
-        priority_order = self.config['tracking']['priority_order']
+    def detect_objects(self, frame):
+        """Run object detection on frame"""
+        # Resize frame to model input size
+        input_size = self.config['performance']['input_size']
+        input_frame = cv2.resize(frame, input_size)
         
-        if label in priority_order:
-            base_priority = len(priority_order) - priority_order.index(label)
-        else:
-            # Check priority classes
-            for level, classes in self.config['detection']['priority_classes'].items():
-                if label in classes:
-                    if level == "high":
-                        base_priority = 10
-                    elif level == "medium":
-                        base_priority = 5
-                    else:
-                        base_priority = 2
-                    break
-            else:
-                base_priority = 1
+        # Convert BGR to RGB
+        input_frame = cv2.cvtColor(input_frame, cv2.COLOR_BGR2RGB)
         
-        return base_priority * confidence
+        # Expand dimensions to match model input
+        input_frame = np.expand_dims(input_frame, axis=0)
+        
+        # Set input tensor
+        self.interpreter.set_tensor(self.input_details[0]['index'], input_frame)
+        
+        # Run inference
+        self.interpreter.invoke()
+        
+        # Get output tensors
+        # MobileNet SSD outputs: [boxes, classes, scores, num_detections]
+        boxes = self.interpreter.get_tensor(self.output_details[0]['index'])[0]  # Bounding box coordinates
+        classes = self.interpreter.get_tensor(self.output_details[1]['index'])[0]  # Class indices
+        scores = self.interpreter.get_tensor(self.output_details[2]['index'])[0]  # Confidence scores
+        
+        return boxes, classes, scores
     
-    def process_detections(self, frame, results):
+    def process_detections(self, frame, boxes, classes, scores):
         """Process detection results"""
         current_detections = {}
-        best_priority = 0
-        best_object = None
+        height, width = frame.shape[:2]
         
-        if results and results[0].boxes is not None:
-            for box in results[0].boxes:
-                cls_id = int(box.cls[0])
-                label = self.model.names[cls_id]
-                conf = float(box.conf[0])
-                
-                x1, y1, x2, y2 = box.xyxy[0]
-                
-                # Scale coordinates back if input was resized
-                if self.config["performance"]["resize_input"]:
-                    scale_x = self.frame_width / self.config["performance"]["input_size"][0]
-                    scale_y = self.frame_height / self.config["performance"]["input_size"][1]
-                    x1, x2 = x1 * scale_x, x2 * scale_x
-                    y1, y2 = y1 * scale_y, y2 * scale_y
-                
-                obj_cx = int((x1 + x2) / 2)
-                obj_cy = int((y1 + y2) / 2)
-                
-                priority = self.calculate_priority(label, conf)
-                
-                detection_data = {
-                    'label': label,
-                    'confidence': conf,
-                    'center': (obj_cx, obj_cy),
-                    'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                    'offset': (obj_cx - self.center_x, obj_cy - self.center_y),
-                    'priority': priority
-                }
-                
-                # Track object history
-                if self.config['detection']['track_objects']:
-                    if label not in self.detection_history:
-                        self.detection_history[label] = deque(maxlen=self.config['tracking']['history_length'])
-                    self.detection_history[label].append(detection_data)
-                
-                current_detections[f"{label}_{len(current_detections)}"] = detection_data
-                
-                if priority > best_priority:
-                    best_priority = priority
-                    best_object = detection_data
-        
-        # Update focus with smoothing
-        if self.config['tracking']['auto_focus'] and best_object:
-            if self.focus_object:
-                # Smooth transition
-                alpha = self.config['tracking']['smoothing']
-                old_x, old_y = self.focus_object['offset']
-                new_x, new_y = best_object['offset']
-                smooth_x = int(old_x * (1 - alpha) + new_x * alpha)
-                smooth_y = int(old_y * (1 - alpha) + new_y * alpha)
-                best_object['offset'] = (smooth_x, smooth_y)
+        for i in range(len(scores)):
+            if scores[i] < self.config['detection']['confidence']:
+                continue
             
-            self.focus_object = best_object
+            # Get class label
+            class_id = int(classes[i])
+            if class_id < len(self.labels):
+                label = self.labels[class_id]
+            else:
+                label = f"class_{class_id}"
+            
+            # Get bounding box
+            ymin, xmin, ymax, xmax = boxes[i]
+            
+            # Convert to pixel coordinates
+            x1 = int(xmin * width)
+            y1 = int(ymin * height)
+            x2 = int(xmax * width)
+            y2 = int(ymax * height)
+            
+            # Calculate center
+            obj_cx = int((x1 + x2) / 2)
+            obj_cy = int((y1 + y2) / 2)
+            
+            detection_data = {
+                'label': label,
+                'confidence': float(scores[i]),
+                'center': (obj_cx, obj_cy),
+                'bbox': (x1, y1, x2, y2),
+                'offset': (obj_cx - self.center_x, obj_cy - self.center_y),
+            }
+            
+            current_detections[f"{label}_{len(current_detections)}"] = detection_data
         
         return current_detections
     
@@ -572,7 +514,6 @@ class DetectionSystem:
         cv2.putText(frame, count_text, (10, 55),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         
-        # Show temperature if available
         if self.thermal_manager:
             temp = self.thermal_manager.get_temperature()
             if temp:
@@ -582,14 +523,13 @@ class DetectionSystem:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, temp_color, 2)
     
     def save_detection_image(self, frame, detections):
-        """Save detection image with metadata"""
+        """Save detection image"""
         if not self.config['output']['save_detections']:
             return
         
         current_time = time.time()
         should_save = current_time - self.last_save_time >= self.config['output']['save_interval']
         
-        # Save on detection if configured
         if self.config['output']['save_on_detection'] and len(detections) == 0:
             should_save = False
         
@@ -602,7 +542,7 @@ class DetectionSystem:
                 self.log_message(f"Error saving image: {e}", "ERROR")
     
     def run(self):
-        """Main run loop with optimized threading"""
+        """Main run loop"""
         self.log_message("Starting detection system...")
         self.log_message("Press 'q' to quit.")
         
@@ -619,7 +559,8 @@ class DetectionSystem:
                 
                 # Check thermal throttling
                 if self.thermal_manager and self.thermal_manager.should_throttle():
-                    time.sleep(0.5)
+                    self.log_message("Thermal throttling active", "WARNING")
+                    time.sleep(1.0)
                     continue
                 
                 # Read frame
@@ -648,49 +589,21 @@ class DetectionSystem:
                 # Process frame
                 process_start = time.time()
                 
-                if self.processor:
-                    # Threaded processing
-                    self.processor.submit_frame(self.pending_frame_id, frame.copy())
-                    self.pending_frame_id += 1
-                    
-                    # Get latest result
-                    result = self.processor.get_result()
-                    if result:
-                        _, results = result
-                        self.last_results = results
-                        self.processed_count += 1
-                    
-                    # Use last results if available
-                    if self.last_results:
-                        detections = self.process_detections(frame, self.last_results)
-                    else:
-                        detections = {}
-                else:
-                    # Synchronous processing
-                    if self.config["performance"]["resize_input"]:
-                        resized = cv2.resize(frame, self.config["performance"]["input_size"])
-                    else:
-                        resized = frame
-                    
-                    results = self.model(resized,
-                                       conf=self.config['detection']['confidence'],
-                                       iou=self.config['detection']['iou_threshold'],
-                                       verbose=False)
-                    
-                    detections = self.process_detections(frame, results)
-                    self.processed_count += 1
+                boxes, classes, scores = self.detect_objects(frame)
+                detections = self.process_detections(frame, boxes, classes, scores)
+                self.processed_count += 1
                 
                 process_time = time.time() - process_start
                 self.processing_times.append(process_time)
                 
-                # Render (possibly skipping frames)
+                # Render
                 should_render = render_counter % self.config['visualization']['render_every_n'] == 0
                 render_counter += 1
                 
-                if should_render and not self.is_high_performance:
+                if should_render:
                     self.draw_detections(frame, detections)
                     self.draw_overlay(frame, detections)
-                    cv2.imshow("Detection System", frame)
+                    cv2.imshow("TFLite Detection System", frame)
                 
                 # Save detections
                 self.save_detection_image(frame, detections)
@@ -702,7 +615,6 @@ class DetectionSystem:
                     fps_start_time = time.time()
                     fps_frame_count = 0
                     
-                    # Log stats periodically
                     avg_process_time = sum(self.processing_times) / len(self.processing_times) if self.processing_times else 0
                     self.log_message(
                         f"FPS: {self.fps:.1f} | Proc: {avg_process_time*1000:.1f}ms | "
@@ -725,10 +637,6 @@ class DetectionSystem:
     def cleanup(self):
         """Cleanup resources"""
         self.log_message("Shutting down...")
-        
-        if self.processor:
-            self.processor.stop()
-            self.processor.join(timeout=1.0)
         
         if self.cap:
             self.cap.release()
@@ -754,15 +662,13 @@ def signal_handler(sig, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Print startup banner
     print("=" * 60)
-    print("  Multi-Object Detection System - Raspberry Pi Optimized")
+    print("  TensorFlow Lite Detection System - Pi 3 Optimized")
     print("=" * 60)
     print(f"  Performance Mode: {CONFIG['performance']['mode']}")
     print(f"  Target FPS: {CONFIG['performance']['throttle_fps']}")
     print(f"  Model: {CONFIG['detection']['model']}")
     print(f"  Max Storage: {CONFIG['system']['max_storage_mb']} MB")
-    print(f"  Threading: {'Enabled' if CONFIG['performance']['use_threading'] else 'Disabled'}")
     print("=" * 60)
     print()
     
