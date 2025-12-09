@@ -209,4 +209,7 @@ __marimo__/
 
 detection_data/
 *.pt
-PI/
+PI/temp.txt
+*.cfg
+*.weights
+*.names
