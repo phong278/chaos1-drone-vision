@@ -1,0 +1,18 @@
+# Raspberry Pi 4 Object Detection Requirements
+# Optimized for ARM architecture and limited resources
+
+# === CORE DEPENDENCIES ===
+opencv-python-headless==4.8.1.78  # Headless OpenCV - specific version for Pi compatibility
+numpy==1.24.0  # Optimized for ARM, avoid latest due to compilation issues
+Pillow==10.0.0  # Image processing
+
+# === UTILITIES ===
+requests==2.31.0  # HTTP requests for model downloading
+tqdm==4.66.0  # Progress bars (optional but helpful)
+psutil==5.9.5  # System monitoring (temperature, memory)
+colorama==0.4.6  # Colored terminal output
+
+# === OPTIONAL (if you need them) ===
+# PyYAML==6.0.2  # Only if you use YAML config files
+# matplotlib==3.7.0  # Only if you need plotting (adds ~100MB)
+# scipy==1.11.0  # Only if you need advanced math operations

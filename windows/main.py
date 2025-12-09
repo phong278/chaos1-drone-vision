@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+YOLOv4-tiny detection system, optimized for Raspberry Pi 4 (OpenCV DNN).
+Modified to print detected objects to terminal and save pictures with storage management.
+"""
+
 import cv2
 import sys
 import signal
@@ -6,9 +12,12 @@ import os
 from datetime import datetime
 from pathlib import Path
 from collections import deque
-from threading import Thread, Lock, Event
-from queue import Queue, Full
+from threading import Thread, Lock
+from queue import Queue, Empty
 import numpy as np
+import urllib.request
+import zipfile
+import io
 
 # ==================== CONFIGURATION ====================
 CONFIG = {
@@ -18,16 +27,18 @@ CONFIG = {
         "data_folder": "detection_data",
         "max_storage_mb": 500,
         "thermal_throttle": True,
-        "temp_threshold": 70,  # Lower for Pi 3
+        "temp_threshold": 75,
     },
     "performance": {
-        "mode": "power_saving",  # Pi 3 needs power saving
-        "throttle_fps": 8,  # Lower FPS for Pi 3
-        "frame_skip": 2,  # Skip more frames
+        "mode": "balanced",
+        "throttle_fps": 15,
+        "frame_skip": 0,
         "resize_input": True,
-        "input_size": (300, 300),  # MobileNet SSD typically uses 300x300
-        "use_threading": False,  # Disable threading on Pi 3 (GIL overhead)
-        "frame_buffer_size": 1,
+        "input_size": (416, 416),
+        "use_threading": True,
+        "frame_buffer_size": 2,
+        "nms_threshold": 0.45,
+        "conf_threshold": 0.35,
     },
     "camera": {
         "device_id": 0,
@@ -40,20 +51,11 @@ CONFIG = {
         "buffer_size": 1,
     },
     "detection": {
-        "model": "detect.tflite",  # Model file (we will load via OpenCV)
-        "labels": "labelmap.txt",  # COCO labels
-        "confidence": 0.5,
-        "track_objects": False,  # Disable tracking for performance
-        "priority_classes": {
-            "high": ["person", "cell phone", "laptop", "cat", "dog"],
-            "medium": ["car", "motorcycle", "bicycle", "bus", "truck", "bottle", "cup"],
-            "low": ["chair", "couch", "bed", "dining table", "tv", "keyboard", "mouse"]
-        },
-    },
-    "tracking": {
-        "priority_order": ["person", "cell phone", "laptop", "cat", "dog"],
-        "auto_focus": False,  # Disable for performance
-        "history_length": 3,
+        "model_cfg": "yolov4-tiny.cfg",
+        "model_weights": "yolov4-tiny.weights",
+        "labels": "coco.names",
+        "confidence": 0.35,
+        "max_classes": 80,
     },
     "visualization": {
         "show_fps": True,
@@ -63,41 +65,34 @@ CONFIG = {
         "render_every_n": 1,
     },
     "output": {
-        "console_log": False,
+        "console_log": True,  # CHANGED: Enable console logging
         "file_log": True,
         "save_detections": True,
-        "save_interval": 60,  # Save less frequently
-        "save_on_detection": True,  # Only save when objects detected
-        "image_quality": 75,  # Lower quality to save space
+        "save_interval": 2,   # CHANGED: Save every 2 seconds (adjust as needed)
+        "save_on_detection": True,
+        "image_quality": 80,
+        "print_detections": True,  # NEW: Print detections to terminal
     }
 }
 
-# ==================== COCO CLASSES ====================
+# ==================== COCO CLASSES (fallback) ====================
 COCO_CLASSES = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
-    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
-    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
-    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
-    'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
-    'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator',
-    'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+    'person','bicycle','car','motorcycle','airplane','bus','train','truck','boat',
+    'traffic light','fire hydrant','stop sign','parking meter','bench','bird','cat',
+    'dog','horse','sheep','cow','elephant','bear','zebra','giraffe','backpack',
+    'umbrella','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball',
+    'kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket',
+    'bottle','wine glass','cup','fork','knife','spoon','bowl','banana','apple',
+    'sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake','chair',
+    'couch','potted plant','bed','dining table','toilet','tv','laptop','mouse',
+    'remote','keyboard','cell phone','microwave','oven','toaster','sink','refrigerator',
+    'book','clock','vase','scissors','teddy bear','hair drier','toothbrush'
 ]
 
 # ==================== COLOR SCHEMES ====================
 COLOR_SCHEMES = {
     "vibrant": {
-        "person": (255, 0, 0),
-        "cell phone": (0, 255, 0),
-        "laptop": (255, 255, 0),
-        "cat": (255, 0, 255),
-        "dog": (0, 255, 255),
-        "car": (255, 165, 0),
-        "bottle": (128, 0, 128),
-        "chair": (0, 128, 128),
-        "default": (200, 200, 200)
+        "default": (200, 200, 200),
     }
 }
 
@@ -107,8 +102,11 @@ class StorageManager:
     def __init__(self, folder_path, max_size_mb):
         self.folder_path = Path(folder_path)
         self.max_size_bytes = max_size_mb * 1024 * 1024
-        self.folder_path.mkdir(exist_ok=True)
+        self.folder_path.mkdir(exist_ok=True, parents=True)
         self.lock = Lock()
+        print(f"📁 Storage folder: {self.folder_path.absolute()}")
+        print(f"💾 Max storage: {max_size_mb} MB")
+
     def get_folder_size(self):
         total = 0
         for file in self.folder_path.glob("detection_*.jpg"):
@@ -117,44 +115,73 @@ class StorageManager:
             except:
                 pass
         return total
+
     def cleanup_old_files(self):
         with self.lock:
             current_size = self.get_folder_size()
             if current_size <= self.max_size_bytes:
                 return
+            
+            print(f"⚠️  Storage limit reached ({current_size/1024/1024:.1f}MB > {self.max_size_bytes/1024/1024:.1f}MB)")
+            print("🧹 Cleaning up old files...")
+            
             files = sorted(self.folder_path.glob("detection_*.jpg"),
                            key=lambda x: x.stat().st_mtime)
+            deleted_count = 0
             for file in files:
-                if current_size <= self.max_size_bytes * 0.8:
+                if current_size <= self.max_size_bytes * 0.8:  # Clean to 80%
                     break
                 try:
                     file_size = file.stat().st_size
                     file.unlink()
                     current_size -= file_size
+                    deleted_count += 1
                 except Exception as e:
-                    print(f"Error deleting {file}: {e}")
-    def save_image(self, image, prefix="detection"):
+                    print(f"❌ Error deleting {file}: {e}")
+            
+            if deleted_count > 0:
+                print(f"✅ Deleted {deleted_count} old files")
+                print(f"📊 New folder size: {current_size/1024/1024:.1f}MB")
+
+    def save_image(self, image, prefix="detection", detections=None):
         self.cleanup_old_files()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        filename = self.folder_path / f"{prefix}_{timestamp}.jpg"
+        
+        # Add detection info to filename if available
+        if detections and len(detections) > 0:
+            labels = [d['label'] for d in detections.values()]
+            label_str = "_".join(sorted(set(labels))[:3])  # First 3 unique labels
+            filename = self.folder_path / f"{prefix}_{label_str}_{timestamp}.jpg"
+        else:
+            filename = self.folder_path / f"{prefix}_{timestamp}.jpg"
+        
         with self.lock:
             cv2.imwrite(str(filename), image,
                        [cv2.IMWRITE_JPEG_QUALITY, CONFIG["output"]["image_quality"]])
+        
+        # Print save confirmation
+        if detections and len(detections) > 0:
+            print(f"💾 Saved: {filename.name} (Detections: {len(detections)})")
+        else:
+            print(f"💾 Saved: {filename.name}")
+        
         return filename
 
 # ==================== THERMAL MANAGER ====================
 class ThermalManager:
     """Monitor and manage Pi temperature"""
-    def __init__(self, threshold=70):
+    def __init__(self, threshold=75):
         self.threshold = threshold
         self.is_raspberry = self._is_raspberry_pi()
         self.throttled = False
+
     def _is_raspberry_pi(self):
         try:
             with open('/proc/device-tree/model', 'r') as f:
                 return 'raspberry' in f.read().lower()
         except:
             return False
+
     def get_temperature(self):
         if not self.is_raspberry:
             return None
@@ -164,6 +191,7 @@ class ThermalManager:
                 return temp
         except:
             return None
+
     def should_throttle(self):
         temp = self.get_temperature()
         if temp is None:
@@ -178,52 +206,78 @@ class ThermalManager:
 
 # ==================== MODEL DOWNLOADER ====================
 class ModelDownloader:
-    """Download TensorFlow Lite models (keeps original behavior)"""
+    """Download YOLO tiny files if missing (best-effort)"""
     @staticmethod
-    def download_model():
-        import urllib.request
-        model_url = "https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip"
-        print("Downloading MobileNet SSD model (4MB)...")
+    def download_file(url, dest):
         try:
-            import zipfile, io
-            response = urllib.request.urlopen(model_url)
-            zip_data = response.read()
-            with zipfile.ZipFile(io.BytesIO(zip_data)) as zip_ref:
-                zip_ref.extractall(".")
-            if os.path.exists("detect.tflite"):
-                print("✅ Model downloaded: detect.tflite")
-            if os.path.exists("labelmap.txt"):
-                print("✅ Labels downloaded: labelmap.txt")
+            print(f"Downloading {url} -> {dest} ...")
+            urllib.request.urlretrieve(url, dest)
+            print("Done.")
             return True
         except Exception as e:
-            print(f"❌ Error downloading model: {e}")
-            print("\nManual download instructions:")
-            print("1. Download: https://storage.googleapis.com/download.tensorflow.org/models/tflite/coco_ssd_mobilenet_v1_1.0_quant_2018_06_29.zip")
-            print("2. Extract detect.tflite and labelmap.txt to current directory")
+            print(f"Download failed: {e}")
             return False
+
+    @staticmethod
+    def ensure_models(cfg_path, weights_path, names_path):
+        ok = True
+        urls = {
+            "weights": "https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights",
+            "cfg": "https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg",
+            "names": "https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names"
+        }
+        if not os.path.exists(cfg_path):
+            ok &= ModelDownloader.download_file(urls["cfg"], cfg_path)
+        if not os.path.exists(weights_path):
+            ok &= ModelDownloader.download_file(urls["weights"], weights_path)
+        if not os.path.exists(names_path):
+            ok &= ModelDownloader.download_file(urls["names"], names_path)
+        if not ok:
+            print("\n⚠️  Could not download all model files automatically.")
+        return ok
+
+# ==================== CAMERA GRABBER (threaded) ====================
+class CameraGrabber(Thread):
+    """Threaded camera grabber to maximize capture throughput."""
+    def __init__(self, cap, queue, stop_event):
+        super().__init__(daemon=True)
+        self.cap = cap
+        self.queue = queue
+        self.stop_event = stop_event
+
+    def run(self):
+        while not self.stop_event.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            try:
+                self.queue.put_nowait(frame)
+            except:
+                pass
 
 # ==================== DETECTION SYSTEM ====================
 class DetectionSystem:
     def __init__(self, config):
         self.config = config
         self.net = None
-        self.dnn_model = None  # cv2.dnn_DetectionModel if available
-        self.cap = None
-        self.detection_history = {}
-        self.frame_count = 0
-        self.processed_count = 0
-        self.start_time = time.time()
-        self.last_save_time = time.time()
-        self.platform = self.detect_platform()
-        self.fps = 0
-        self.processing_times = deque(maxlen=30)
         self.labels = []
-        # Initialize managers
+        self.cap = None
+        self.frame_queue = None
+        self.grabber = None
+        self.stop_event = None
         self.storage_manager = StorageManager(self.config["system"]["data_folder"],
                                               self.config["system"]["max_storage_mb"])
         self.thermal_manager = ThermalManager(self.config["system"]["temp_threshold"]) \
             if self.config["system"]["thermal_throttle"] else None
-        # Initialize system
+        self.platform = self.detect_platform()
+        self.frame_count = 0
+        self.processed_count = 0
+        self.start_time = time.time()
+        self.fps = 0.0
+        self.processing_times = deque(maxlen=30)
+        self.last_print_time = time.time()
+        self.print_interval = 1.0  # Print detections every 1 second
         self.setup_logging()
         self.init_system()
 
@@ -252,7 +306,6 @@ class DetectionSystem:
             with open(self.log_file, 'w') as f:
                 f.write(f"Detection System Log - Started at {timestamp}\n")
                 f.write(f"Platform: {self.platform}\n")
-                f.write(f"Performance Mode: {self.config['performance']['mode']}\n")
                 f.write("=" * 50 + "\n")
 
     def log_message(self, message, level="INFO"):
@@ -264,90 +317,99 @@ class DetectionSystem:
             with open(self.log_file, 'a') as f:
                 f.write(formatted_msg + "\n")
 
+    def print_detections_to_terminal(self, detections):
+        """Print detected objects to terminal"""
+        if not detections or not self.config["output"]["print_detections"]:
+            return
+        
+        current_time = time.time()
+        if current_time - self.last_print_time < self.print_interval:
+            return
+        
+        self.last_print_time = current_time
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        print(f"\n{'='*50}")
+        print(f"📸 DETECTIONS @ {timestamp} (Frame {self.frame_count})")
+        print(f"{'='*50}")
+        
+        # Group detections by label
+        detection_groups = {}
+        for det in detections.values():
+            label = det['label']
+            if label not in detection_groups:
+                detection_groups[label] = []
+            detection_groups[label].append(det)
+        
+        # Print grouped detections
+        for label, det_list in detection_groups.items():
+            confidences = [d['confidence'] for d in det_list]
+            avg_conf = sum(confidences) / len(confidences)
+            print(f"  • {label.upper()}: {len(det_list)} instance(s), avg confidence: {avg_conf:.1%}")
+            for det in det_list[:2]:  # Show first 2 instances
+                bbox = det['bbox']
+                print(f"    └─ {det['confidence']:.1%} at [{bbox[0]},{bbox[1]}]→[{bbox[2]},{bbox[3]}]")
+        
+        print(f"{'='*50}")
+
     def load_labels(self):
         label_file = self.config['detection']['labels']
         if os.path.exists(label_file):
             with open(label_file, 'r') as f:
-                self.labels = [line.strip() for line in f.readlines()]
-            self.labels = [label.split(' ', 1)[-1] if ' ' in label else label for label in self.labels]
-            self.log_message(f"Loaded {len(self.labels)} labels")
+                self.labels = [line.strip() for line in f.readlines() if line.strip()]
+            self.log_message(f"Loaded {len(self.labels)} labels from {label_file}")
         else:
             self.log_message("Label file not found, using default COCO classes", "WARNING")
             self.labels = COCO_CLASSES
 
     def init_system(self):
         self.log_message(f"Initializing on platform: {self.platform}")
-        model_path = self.config['detection']['model']
-        if not os.path.exists(model_path):
-            self.log_message(f"Model not found: {model_path}", "WARNING")
-            self.log_message("Attempting to download model...")
-            if not ModelDownloader.download_model():
-                self.log_message("Failed to download model", "ERROR")
-                sys.exit(1)
+        cfg = self.config['detection']['model_cfg']
+        weights = self.config['detection']['model_weights']
+        names = self.config['detection']['labels']
+
+        if not (os.path.exists(cfg) and os.path.exists(weights)):
+            self.log_message("Model files not found, attempting to download (best-effort).", "WARNING")
+            ModelDownloader.ensure_models(cfg, weights, names)
+
+        if not os.path.exists(cfg) or not os.path.exists(weights):
+            self.log_message("Model files missing. Exiting.", "ERROR")
+            print("Please ensure YOLO cfg/weights are present or allow the downloader to fetch them.")
+            sys.exit(1)
+
         self.load_labels()
-        # LOAD model via OpenCV DNN (no TensorFlow needed)
-        self.log_message(f"Loading model with OpenCV DNN: {model_path}")
+
         try:
-            # Try to load TFLite directly (available in newer OpenCV)
-            if hasattr(cv2.dnn, "readNetFromTFLite"):
-                try:
-                    self.net = cv2.dnn.readNetFromTFLite(model_path)
-                    self.log_message("Loaded model with readNetFromTFLite()")
-                except Exception as e:
-                    # sometimes readNetFromTFLite exists but fails for some builds; fall back
-                    self.log_message(f"readNetFromTFLite failed: {e}", "WARNING")
-                    self.net = None
-            if self.net is None:
-                # Generic fallback: try readNet (OpenCV will try to detect type)
-                self.net = cv2.dnn.readNet(model_path)
-                self.log_message("Loaded model with readNet() fallback")
-            # Prefer CPU
+            self.net = cv2.dnn.readNetFromDarknet(cfg, weights)
             try:
-                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
             except Exception:
                 pass
-            # Wrap into DetectionModel if available (simpler API)
-            if hasattr(cv2.dnn, "DetectionModel"):
-                try:
-                    self.dnn_model = cv2.dnn_DetectionModel(self.net)
-                    input_w, input_h = self.config["performance"]["input_size"]
-                    # Use typical preprocessing for MobileNet SSD quantized/floating models:
-                    # Scale and mean chosen to map [0,255] -> [-1,1] (works for many TF SSD models).
-                    # If you find detections are poor, try scale=1.0 and mean=(0,0,0)
-                    scale = 1.0 / 127.5
-                    mean = (127.5, 127.5, 127.5)
-                    self.dnn_model.setInputSize(input_w, input_h)
-                    self.dnn_model.setInputScale(scale)
-                    self.dnn_model.setInputMean(mean)
-                    self.dnn_model.setInputSwapRB(True)
-                    self.log_message("Wrapped net in cv2.dnn_DetectionModel and set input params")
-                except Exception as e:
-                    self.log_message(f"Could not create DetectionModel: {e}", "WARNING")
-                    self.dnn_model = None
-            # Warm up (single forward)
-            try:
-                dummy = np.zeros((1, 3, self.config["performance"]["input_size"][1],
-                                  self.config["performance"]["input_size"][0]), dtype=np.float32)
-                # If DetectionModel exists, call detect on a dummy
-                if self.dnn_model is not None:
-                    # create a blank image and run detect once
-                    blank = np.zeros((self.config["camera"]["height"], self.config["camera"]["width"], 3), dtype=np.uint8)
-                    self.dnn_model.detect(blank, confThreshold=0.1)
-                else:
-                    self.net.setInput(dummy)
-                    _ = self.net.forward()
-                self.log_message("Model warmed up")
-            except Exception:
-                # not critical
-                pass
+            ln = self.net.getLayerNames()
+            layer_indices = self.net.getUnconnectedOutLayers()
+
+            # Handle different return types on different platforms
+            if layer_indices.ndim == 2:
+                # Linux/Raspberry Pi returns 2D array
+                self.output_layer_names = [ln[i[0] - 1] for i in layer_indices]
+            else:
+                # Windows returns 1D array
+                self.output_layer_names = [ln[i - 1] for i in layer_indices]
+            self.log_message("YOLO network loaded successfully.")
         except Exception as e:
-            self.log_message(f"Error loading model with OpenCV DNN: {e}", "ERROR")
+            self.log_message(f"Failed to load YOLO network: {e}", "ERROR")
             import traceback
             traceback.print_exc()
             sys.exit(1)
-        # Initialize camera
+
         self.init_camera()
+
+        self.frame_queue = Queue(maxsize=self.config["performance"]["frame_buffer_size"])
+        self.stop_event = ThreadEvent()
+        if self.config["performance"]["use_threading"]:
+            self.grabber = CameraGrabber(self.cap, self.frame_queue, self.stop_event)
+            self.grabber.start()
 
     def init_camera(self):
         self.log_message(f"Initializing camera {self.config['camera']['device_id']}")
@@ -366,93 +428,70 @@ class DetectionSystem:
         self.cap.set(cv2.CAP_PROP_FPS, self.config['camera']['fps'])
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.frame_fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.center_x = self.frame_width // 2
         self.center_y = self.frame_height // 2
-        self.log_message(f"Camera initialized: {self.frame_width}x{self.frame_height} @ {self.frame_fps:.1f} FPS")
+        self.log_message(f"Camera initialized: {self.frame_width}x{self.frame_height} @ {self.cap.get(cv2.CAP_PROP_FPS):.1f} FPS")
 
     def get_color(self, label):
         scheme = COLOR_SCHEMES.get(self.config['visualization']['color_scheme'], COLOR_SCHEMES['vibrant'])
         return scheme.get(label, scheme['default'])
 
     def detect_objects(self, frame):
-        """
-        Run object detection using OpenCV DNN.
-        Returns: boxes (N x 4 normalized ymin,xmin,ymax,xmax), classes (N,), scores (N,)
-        """
-        input_size = self.config['performance']['input_size']  # (w,h)
-        conf_thresh = self.config['detection']['confidence']
+        net = self.net
+        input_w, input_h = self.config["performance"]["input_size"]
+        conf_thresh = self.config["performance"]["conf_threshold"]
+        nms_thresh = self.config["performance"]["nms_threshold"]
 
-        # If we have a DetectionModel, use detect() which returns classIds, confidences, boxes (x,y,w,h)
-        if self.dnn_model is not None:
-            # detect accepts the original image; it handles preprocessing internally
-            class_ids, confidences, boxes = self.dnn_model.detect(frame, confThreshold=conf_thresh)
-            if len(class_ids) == 0:
-                return np.zeros((0,4), dtype=float), np.array([], dtype=int), np.array([], dtype=float)
-            # convert to arrays
-            class_ids = np.array(class_ids).reshape(-1)
-            confidences = np.array(confidences).reshape(-1)
-            boxes = np.array(boxes).reshape(-1, 4)  # x,y,w,h
-            # convert to ymin,xmin,ymax,xmax normalized
-            out_boxes = []
-            height, width = frame.shape[:2]
-            for (x, y, w, h) in boxes:
-                xmin = float(x) / width
-                ymin = float(y) / height
-                xmax = float(x + w) / width
-                ymax = float(y + h) / height
-                out_boxes.append([ymin, xmin, ymax, xmax])
-            out_boxes = np.array(out_boxes, dtype=float)
-            return out_boxes, class_ids, confidences
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (input_w, input_h), swapRB=True, crop=False)
+        net.setInput(blob)
+        outs = net.forward(self.output_layer_names)
 
-        # Fallback: use net.forward() and try to parse typical SSD output [1,1,N,7]
-        blob = cv2.dnn.blobFromImage(frame, scalefactor=1.0/127.5,
-                                     size=input_size, mean=(127.5,127.5,127.5),
-                                     swapRB=True, crop=False)
-        self.net.setInput(blob)
-        outs = self.net.forward()
-        # Expected shape for TF SSD: [1,1,N,7] where each row = [batch_id, class_id, score, xmin, ymin, xmax, ymax]
-        # But many variants exist; we attempt robust parsing:
-        if isinstance(outs, list) or isinstance(outs, tuple):
-            # if net.forward() returns multiple blobs, try to find the detection blob
-            detection_blob = None
-            for o in outs:
-                if o.ndim == 4 and o.shape[3] == 7:
-                    detection_blob = o
-                    break
-            if detection_blob is None:
-                # last resort, pick first output
-                detection_blob = outs[0]
-        else:
-            detection_blob = outs
-
+        height, width = frame.shape[:2]
         boxes = []
-        classes = []
-        scores = []
-        if detection_blob.ndim == 4 and detection_blob.shape[3] == 7:
-            dets = detection_blob[0, 0]
-            h, w = frame.shape[:2]
-            for d in dets:
-                score = float(d[2])
-                if score < conf_thresh:
+        confidences = []
+        class_ids = []
+
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                if scores.size == 0:
                     continue
-                class_id = int(d[1])
-                xmin = float(d[3])
-                ymin = float(d[4])
-                xmax = float(d[5])
-                ymax = float(d[6])
-                # convert to normalized ymin,xmin,ymax,xmax
-                boxes.append([ymin, xmin, ymax, xmax])
-                classes.append(class_id)
-                scores.append(score)
-        else:
-            # Unknown output format; return empty results
+                class_id = int(np.argmax(scores))
+                conf = float(scores[class_id])
+                if conf > conf_thresh:
+                    cx = int(detection[0] * width)
+                    cy = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    x = int(cx - w / 2)
+                    y = int(cy - h / 2)
+                    boxes.append([x, y, w, h])
+                    confidences.append(conf)
+                    class_ids.append(class_id)
+
+        if len(boxes) == 0:
             return np.zeros((0,4), dtype=float), np.array([], dtype=int), np.array([], dtype=float)
 
-        return np.array(boxes, dtype=float), np.array(classes, dtype=int), np.array(scores, dtype=float)
+        idxs = cv2.dnn.NMSBoxes(boxes, confidences, conf_thresh, nms_thresh)
+        if len(idxs) == 0:
+            return np.zeros((0,4), dtype=float), np.array([], dtype=int), np.array([], dtype=float)
+
+        out_boxes = []
+        out_classes = []
+        out_scores = []
+        for i in idxs.flatten():
+            x, y, w, h = boxes[i]
+            xmin = max(0.0, float(x) / width)
+            ymin = max(0.0, float(y) / height)
+            xmax = min(1.0, float(x + w) / width)
+            ymax = min(1.0, float(y + h) / height)
+            out_boxes.append([ymin, xmin, ymax, xmax])
+            out_classes.append(class_ids[i])
+            out_scores.append(confidences[i])
+
+        return np.array(out_boxes, dtype=float), np.array(out_classes, dtype=int), np.array(out_scores, dtype=float)
 
     def process_detections(self, frame, boxes, classes, scores):
-        """Process detection results coming from detect_objects (boxes normalized)"""
         current_detections = {}
         height, width = frame.shape[:2]
 
@@ -461,17 +500,14 @@ class DetectionSystem:
                 continue
 
             class_id = int(classes[i])
-            # Some models use class indices starting at 1 (COCO). If label list starts at 0 adjust:
             label = f"class_{class_id}"
             if class_id < len(self.labels):
                 label = self.labels[class_id]
             elif 0 <= class_id - 1 < len(self.labels):
-                # try class_id - 1 (common TF offset)
                 label = self.labels[class_id - 1]
 
             ymin, xmin, ymax, xmax = boxes[i]
 
-            # Convert to pixel coordinates (clamp)
             x1 = int(max(0, xmin) * width)
             y1 = int(max(0, ymin) * height)
             x2 = int(min(1, xmax) * width)
@@ -525,64 +561,89 @@ class DetectionSystem:
     def save_detection_image(self, frame, detections):
         if not self.config['output']['save_detections']:
             return
+        
         current_time = time.time()
-        should_save = current_time - self.last_save_time >= self.config['output']['save_interval']
+        should_save = current_time - getattr(self, "last_save_time", 0) >= self.config['output']['save_interval']
+        
         if self.config['output']['save_on_detection'] and len(detections) == 0:
             should_save = False
+            
         if should_save:
             try:
-                filename = self.storage_manager.save_image(frame)
-                self.log_message(f"Saved: {filename.name}")
+                # Pass detections to include in filename
+                filename = self.storage_manager.save_image(frame, detections=detections)
                 self.last_save_time = current_time
             except Exception as e:
                 self.log_message(f"Error saving image: {e}", "ERROR")
 
     def run(self):
-        self.log_message("Starting detection system...")
+        self.log_message("Starting YOLO detection system...")
         self.log_message("Press 'q' to quit.")
         fps_start_time = time.time()
         fps_frame_count = 0
         frame_skip_counter = 0
         render_counter = 0
         target_frame_time = 1.0 / self.config['performance']['throttle_fps'] if self.config['performance']['throttle_fps'] > 0 else 0
+
         try:
             while True:
                 loop_start = time.time()
+
                 if self.thermal_manager and self.thermal_manager.should_throttle():
                     self.log_message("Thermal throttling active", "WARNING")
                     time.sleep(1.0)
                     continue
-                ret, frame = self.cap.read()
-                if not ret:
-                    self.log_message("Error reading frame", "ERROR")
-                    break
+
+                frame = None
+                if self.config["performance"]["use_threading"] and self.frame_queue is not None:
+                    try:
+                        frame = self.frame_queue.get(timeout=1.0)
+                    except Empty:
+                        continue
+                else:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        self.log_message("Error reading frame", "ERROR")
+                        break
+
                 self.frame_count += 1
+
                 if self.config['camera']['flip_horizontal']:
                     frame = cv2.flip(frame, 1)
                 if self.config['camera']['flip_vertical']:
                     frame = cv2.flip(frame, 0)
+
                 if frame_skip_counter > 0:
                     frame_skip_counter -= 1
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                     continue
                 frame_skip_counter = self.config['performance']['frame_skip']
+
                 process_start = time.time()
                 boxes, classes, scores = self.detect_objects(frame)
                 detections = self.process_detections(frame, boxes, classes, scores)
                 self.processed_count += 1
                 process_time = time.time() - process_start
                 self.processing_times.append(process_time)
+
+                # PRINT DETECTIONS TO TERMINAL
+                self.print_detections_to_terminal(detections)
+
                 should_render = render_counter % self.config['visualization']['render_every_n'] == 0
                 render_counter += 1
                 if should_render:
                     self.draw_detections(frame, detections)
                     self.draw_overlay(frame, detections)
-                    cv2.imshow("Detection System (OpenCV DNN)", frame)
+                    cv2.imshow("YOLO Detection (OpenCV DNN)", frame)
+
+                # SAVE IMAGE WITH STORAGE MANAGEMENT
                 self.save_detection_image(frame, detections)
+
                 fps_frame_count += 1
                 if time.time() - fps_start_time >= 1.0:
-                    self.fps = fps_frame_count / (time.time() - fps_start_time)
+                    elapsed = time.time() - fps_start_time
+                    self.fps = fps_frame_count / elapsed if elapsed > 0 else 0.0
                     fps_start_time = time.time()
                     fps_frame_count = 0
                     avg_process_time = sum(self.processing_times) / len(self.processing_times) if self.processing_times else 0
@@ -590,17 +651,22 @@ class DetectionSystem:
                         f"FPS: {self.fps:.1f} | Proc: {avg_process_time*1000:.1f}ms | "
                         f"Detections: {len(detections)}"
                     )
+
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
+
                 elapsed = time.time() - loop_start
                 sleep_time = target_frame_time - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
+
         finally:
             self.cleanup()
 
     def cleanup(self):
         self.log_message("Shutting down...")
+        if getattr(self, "stop_event", None):
+            self.stop_event.set()
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
@@ -612,22 +678,39 @@ class DetectionSystem:
             avg_fps = self.processed_count / runtime
             self.log_message(f"Average FPS: {avg_fps:.1f}")
 
+
+# Simple Event wrapper for clean thread stop
+class ThreadEvent:
+    def __init__(self):
+        self._flag = False
+
+    def is_set(self):
+        return self._flag
+
+    def set(self):
+        self._flag = True
+
+
 # ==================== MAIN EXECUTION ====================
 def signal_handler(sig, frame):
     print("\n\n[!] Ctrl+C detected. Shutting down...")
     sys.exit(0)
 
+
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     print("=" * 60)
-    print("  OpenCV DNN Detection System - Pi 3 Optimized (no TFLite)")
+    print("  YOLO Detection System - Optimized for Pi4 (OpenCV DNN)")
     print("=" * 60)
     print(f"  Performance Mode: {CONFIG['performance']['mode']}")
     print(f"  Target FPS: {CONFIG['performance']['throttle_fps']}")
-    print(f"  Model: {CONFIG['detection']['model']}")
-    print(f"  Max Storage: {CONFIG['system']['max_storage_mb']} MB")
+    print(f"  Model cfg: {CONFIG['detection']['model_cfg']}")
+    print(f"  Model weights: {CONFIG['detection']['model_weights']}")
+    print(f"  Save images: {'YES' if CONFIG['output']['save_detections'] else 'NO'}")
+    print(f"  Max storage: {CONFIG['system']['max_storage_mb']}MB")
     print("=" * 60)
     print()
+
     try:
         system = DetectionSystem(CONFIG)
         system.run()
