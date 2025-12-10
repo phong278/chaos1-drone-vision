@@ -13,57 +13,23 @@ import numpy as np
 import urllib.request
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from streaming_server import VideoStreamer
+# Import config loader and load configuration
+from config_loader import ConfigLoader
 
-# ==================== CONFIGURATION FOR PI 4 ====================
-CONFIG = {
-    "system": {
-        "platform": "raspberry",
-        "log_to_file": True,
-        "data_folder": "detection_data",
-        "max_storage_mb": 500,
-        "thermal_throttle": True,
-        "temp_threshold": 75,
-        "enable_streaming": True,
-        "streaming_port": 5000,
-    },
-    "performance": {
-        "mode": "balanced",
-        "throttle_fps": 10,        # Reduced for Pi 4 stability
-        "frame_skip": 1,           # Skip every other frame
-        "resize_input": True,
-        "input_size": (320, 320),  # Smaller for Pi 4 speed
-        "use_threading": True,
-        "frame_buffer_size": 2,
-        "nms_threshold": 0.45,
-        "conf_threshold": 0.40,    # Higher threshold for fewer false positives
-    },
-    "camera": {
-        "device_id": 0,
-        "width": 640,
-        "height": 480,
-        "fps": 15,                 # Lower FPS for Pi 4
-        "flip_horizontal": False,
-        "flip_vertical": False,
-        "backend": cv2.CAP_V4L2,
-        "buffer_size": 1,
-    },
-    "detection": {
-        "model_cfg": "yolov4-tiny.cfg",
-        "model_weights": "yolov4-tiny.weights",
-        "labels": "coco.names",
-        "confidence": 0.40,
-        "max_classes": 80,
-    },
-    "output": {
-        "console_log": True,
-        "file_log": True,
-        "save_detections": True,
-        "save_interval": 5,        # Save every 5 seconds to reduce I/O
-        "save_on_detection": True,
-        "image_quality": 70,       # Lower quality for smaller files
-        "print_detections": True,
-    }
-}
+# ==================== LOAD CONFIGURATION ====================
+# Load from config.json, fall back to defaults if not found
+CONFIG = ConfigLoader.load("config.json")
+
+# Convert backend string to OpenCV constant
+if CONFIG["camera"]["backend"] == "CAP_V4L2":
+    CONFIG["camera"]["backend"] = cv2.CAP_V4L2
+elif CONFIG["camera"]["backend"] == "CAP_ANY":
+    CONFIG["camera"]["backend"] = cv2.CAP_ANY
+else:
+    CONFIG["camera"]["backend"] = cv2.CAP_ANY  # Default
+
+# Convert input_size from list to tuple
+CONFIG["performance"]["input_size"] = tuple(CONFIG["performance"]["input_size"])
 
 # ==================== COCO CLASSES (fallback) ====================
 COCO_CLASSES = [
@@ -391,11 +357,13 @@ class DetectionSystem:
     def init_camera(self):
         print("Initializing camera...")
         try:
-            # Force V4L2 for Pi
-            self.cap = cv2.VideoCapture(self.config['camera']['device_id'], cv2.CAP_V4L2)
+            # Use the backend from config (now converted to OpenCV constant)
+            backend = self.config['camera']['backend']
+            
+            self.cap = cv2.VideoCapture(self.config['camera']['device_id'], backend)
             
             if not self.cap.isOpened():
-                print("Could not open camera")
+                print(f"Could not open camera with backend {backend}, trying default...")
                 # Try default backend as fallback
                 self.cap = cv2.VideoCapture(self.config['camera']['device_id'])
                 if not self.cap.isOpened():
