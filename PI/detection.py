@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-YOLOv4-tiny detection system - EXCLUSIVELY FOR RASPBERRY PI 4
-Headless version with no GUI display - optimized for drone use
-"""
-
 import cv2
 import sys
 import signal
@@ -16,6 +11,8 @@ from threading import Thread, Lock
 from queue import Queue, Empty
 import numpy as np
 import urllib.request
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from streaming_server import VideoStreamer
 
 # ==================== CONFIGURATION FOR PI 4 ====================
 CONFIG = {
@@ -26,6 +23,8 @@ CONFIG = {
         "max_storage_mb": 500,
         "thermal_throttle": True,
         "temp_threshold": 75,
+        "enable_streaming": True,
+        "streaming_port": 5000,
     },
     "performance": {
         "mode": "balanced",
@@ -269,6 +268,15 @@ class DetectionSystem:
         self.print_interval = 2.0  # Print every 2 seconds to reduce spam
         self.setup_logging()
         self.init_system()
+
+        self.streaming_enabled = config["system"].get("enable_streaming",False)
+        self.streamer = None
+
+        if self.streaming_enabled:
+            print("Enabling remote streaming...")
+            self.streamer = VideoStreamer(port=config["system"].get("streaming_port",5000))
+            self.streamer.run()
+            time.sleep(1)
 
     def setup_logging(self):
         if self.config["system"]["log_to_file"]:
@@ -527,8 +535,21 @@ class DetectionSystem:
         print("• Press Ctrl+C to stop")
         print("• Detections print every 2 seconds")
         print("• Images save every 5 seconds")
+
+        #streaming info
+        if self.streaming_enabled and self.streamer:
+            print("• Live stream: http://{YOUR_PI_IP}:5000")
+            print("• Web interface with detections")
+
         print("="*50 + "\n")
         
+        if self.streaming_enabled and not self.streamer:
+            print("Starting streaming server...")
+            from streaming_server import VideoStreamer
+            self.streamer - VideoStreamer(port=self.config["system"].get("streaming_port",5000))
+            self.streamer.run()
+            time.sleep(1)
+
         fps_start_time = time.time()
         fps_frame_count = 0
         frame_skip_counter = 0
@@ -575,6 +596,18 @@ class DetectionSystem:
                 # Print to terminal
                 self.print_detections_to_terminal(detections)
 
+                #update streaming server with current frame and detections
+                if self.streaming_enabled and self.streamer:
+                    temp = self.thermal_manager.get_temperature()
+
+                    self.streamer.update_frame(
+                        frame=frame,
+                        detections=detections,
+                        fps=self.fps,
+                        frame_count=self.frame_count,
+                        temperature=temp,
+                        processing_time=process_time
+                    )
                 # Save image if needed
                 self.save_detection_image(frame, detections)
 
@@ -589,7 +622,18 @@ class DetectionSystem:
                     # Print status
                     temp = self.thermal_manager.get_temperature()
                     if temp:
-                        print(f"Status: {self.fps:.1f} FPS | {temp:.1f}°C | Frame {self.frame_count}")
+                        status_msg = f"Status: {self.fps:.1f} FPS | {temp:.1f}°C | Frame {self.frame_count}"
+                        
+                        if self.streaming_enabled and self.streamer:
+                            import socket
+                            try:
+                                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                                s.connect(('8.8.8.8',1))
+                                ip = s.getsockname()[0]
+                                status_msg += f" | Stream: http://{ip}:5000"
+                            except:
+                                status_msg += f" | Stream: http://YOUR_PI_IP:5000"
+                        print(status_msg)
 
                 # Small delay to prevent overheating
                 elapsed = time.time() - loop_start
