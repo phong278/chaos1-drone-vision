@@ -16,6 +16,7 @@ class ConfigLoader:
             "temp_threshold": 75,
             "enable_streaming": True,
             "streaming_port": 5000,
+            "max_streaming_clients": 5,
         },
         "performance": {
             "mode": "balanced",

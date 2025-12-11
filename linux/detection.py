@@ -235,14 +235,28 @@ class DetectionSystem:
         self.setup_logging()
         self.init_system()
 
-        self.streaming_enabled = config["system"].get("enable_streaming",False)
+        self.streaming_enabled = config["system"].get("enable_streaming", False)
         self.streamer = None
-
+        
         if self.streaming_enabled:
-            print("Enabling remote streaming...")
-            self.streamer = VideoStreamer(port=config["system"].get("streaming_port",5000))
+            print("Enabling optimized remote streaming...")
+            streaming_port = config["system"].get("streaming_port", 5000)
+            max_clients = config["system"].get("max_streaming_clients", 20)
+            
+            self.streamer = VideoStreamer(port=streaming_port, max_clients=max_clients)
             self.streamer.run()
-            time.sleep(1)
+            time.sleep(1)  # Let server start
+            
+            # Log streaming info
+            import socket
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(('8.8.8.8', 1))
+                ip = s.getsockname()[0]
+                print(f"📡 Stream URL: http://{ip}:{streaming_port}")
+                print(f"👥 Max concurrent viewers: {max_clients}")
+            except:
+                print("📡 Stream URL: http://YOUR_PI_IP:{streaming_port}")
 
     def setup_logging(self):
         if self.config["system"]["log_to_file"]:
@@ -497,30 +511,46 @@ class DetectionSystem:
                 self.log_message(f"Error saving image: {e}", "ERROR")
 
     def run(self):
-        print("\n" + "="*50)
+        print("\n" + "="*60) 
         print("PI 4 DETECTION SYSTEM STARTING")
-        print("="*50)
+        print("="*60)
         print("• Press Ctrl+C to stop")
         print("• Detections print every 2 seconds")
         print("• Images save every 5 seconds")
 
         #streaming info
-        if self.streaming_enabled and self.streamer:
-            print("• Live stream: http://{YOUR_PI_IP}:5000")
-            print("• Web interface with detections")
-
-        print("="*50 + "\n")
+        if self.streaming_enabled:
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(('8.8.8.8', 1))
+                ip = s.getsockname()[0]
+                port = self.config["system"].get("streaming_port", 5000)
+                max_clients = self.config["system"].get("max_streaming_clients", 15)
+                print(f"• Live stream: http://{ip}:{port}")
+                print(f"• Web interface with real-time detections")
+                print(f"• Max concurrent viewers: {max_clients}")
+            except:
+                port = self.config["system"].get("streaming_port", 5000)
+                print(f"• Live stream: http://YOUR_PI_IP:{port}")
+                print(f"• Web interface with real-time detections")
+        
+        print("="*60 + "\n")
         
         if self.streaming_enabled and not self.streamer:
-            print("Starting streaming server...")
+            print("Starting optimized streaming server...")
             from streaming_server import VideoStreamer
-            self.streamer - VideoStreamer(port=self.config["system"].get("streaming_port",5000))
+            port = self.config["system"].get("streaming_port", 5000)
+            max_clients = self.config["system"].get("max_streaming_clients", 15)
+            self.streamer = VideoStreamer(port=port, max_clients=max_clients)  
             self.streamer.run()
             time.sleep(1)
 
         fps_start_time = time.time()
         fps_frame_count = 0
         frame_skip_counter = 0
+        last_stream_update = 0
+        stream_update_interval = 0.033
 
         try:
             while True:
@@ -529,8 +559,13 @@ class DetectionSystem:
                 # Thermal throttling check
                 if self.thermal_manager.should_throttle():
                     print("Thermal throttling - slowing down...")
-                    time.sleep(2.0)
+                    if self.streaming_enabled and self.streamer:
+                        # Adjust streaming FPS when throttled
+                        stream_update_interval = 0.1  # 10 FPS when throttled
+                    time.sleep(1.0)
                     continue
+                else:
+                    stream_update_interval = 0.033
 
                 # Get frame
                 frame = None
@@ -561,21 +596,27 @@ class DetectionSystem:
                 process_time = time.time() - process_start
                 self.processing_times.append(process_time)
 
-                # Print to terminal
+                
                 self.print_detections_to_terminal(detections)
 
-                #update streaming server with current frame and detections
-                if self.streaming_enabled and self.streamer:
+                # Update streaming server with current frame and detections
+                # Throttle streaming updates to prevent overloading
+                current_time = time.time()
+                if self.streaming_enabled and self.streamer and \
+                (current_time - last_stream_update >= stream_update_interval):
+                    
                     temp = self.thermal_manager.get_temperature()
-
+                    
                     self.streamer.update_frame(
                         frame=frame,
                         detections=detections,
                         fps=self.fps,
                         frame_count=self.frame_count,
                         temperature=temp,
-                        processing_time=process_time
+                        processing_time=process_time * 1000  # Convert to milliseconds
                     )
+                    last_stream_update = current_time
+                
                 # Save image if needed
                 self.save_detection_image(frame, detections)
 
@@ -590,18 +631,31 @@ class DetectionSystem:
                     # Print status
                     temp = self.thermal_manager.get_temperature()
                     if temp:
-                        status_msg = f"Status: {self.fps:.1f} FPS | {temp:.1f}°C | Frame {self.frame_count}"
-                        
+                        # Show streaming client count
+                        client_info = ""
                         if self.streaming_enabled and self.streamer:
-                            import socket
-                            try:
-                                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                                s.connect(('8.8.8.8',1))
-                                ip = s.getsockname()[0]
-                                status_msg += f" | Stream: http://{ip}:5000"
-                            except:
-                                status_msg += f" | Stream: http://YOUR_PI_IP:5000"
+                            client_info = f" | Viewers: {self.streamer.active_clients}"
+                        
+                        status_msg = f"Status: {self.fps:5.1f} FPS | {temp:5.1f}°C | Frame {self.frame_count}{client_info}"
+                        
+                        # Show detection count
+                        if detections:
+                            detection_types = {}
+                            for det in detections.values():
+                                label = det['label']
+                                detection_types[label] = detection_types.get(label, 0) + 1
+                            
+                            detection_str = " | Detections: "
+                            detection_str += ", ".join([f"{count}x {label}" for label, count in list(detection_types.items())[:3]])
+                            if len(detection_types) > 3:
+                                detection_str += f" (+{len(detection_types)-3} more)"
+                            status_msg += detection_str
+                        
                         print(status_msg)
+                        
+                        # Warning if many streaming clients
+                        if self.streaming_enabled and self.streamer and self.streamer.active_clients > 5:
+                            print(f"   High viewer count: {self.streamer.active_clients} clients connected")
 
                 # Small delay to prevent overheating
                 elapsed = time.time() - loop_start
@@ -612,6 +666,10 @@ class DetectionSystem:
 
         except KeyboardInterrupt:
             print("\n\nStopping detection system...")
+        except Exception as e:
+            print(f"\n\nUnexpected error: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             self.cleanup()
 
