@@ -11,6 +11,7 @@ requests==2.31.0  # HTTP requests for model downloading
 tqdm==4.66.0  # Progress bars (optional but helpful)
 psutil==5.9.5  # System monitoring (temperature, memory)
 colorama==0.4.6  # Colored terminal output
+Flask==3.1.2
 
 # === OPTIONAL (if you need them) ===
 # PyYAML==6.0.2  # Only if you use YAML config files
