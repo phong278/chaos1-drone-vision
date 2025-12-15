@@ -901,9 +901,7 @@ class VideoStreamer:
         print(f"Network Access:  http://{ip}:{self.port}")
         print(f"Max Clients:     {self.max_clients}")
         print("="*70)
-        print("Tip: For best performance with 10+ clients:")
-        print("       1. Use: pip install gunicorn gevent")
-        print(f"       2. Run: gunicorn -w 4 -k gevent streaming_server:app --bind 0.0.0.0:{self.port}")
+        
         print("="*70 + "\n")
         
         return server_thread

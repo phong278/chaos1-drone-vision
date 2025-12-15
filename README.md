@@ -366,7 +366,9 @@ pi_detection_system/
 
 ## License & Intellectual Property
 
-Copyright © 2025. All Rights Reserved.
+Copyright © 2025 Muhammad Abdullah and Phong Ngo.
+
+All rights jointly owned. No license or transfer without written consent of both parties.
 
 ### Proprietary Software Notice
 

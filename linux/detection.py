@@ -209,7 +209,7 @@ class CameraGrabber(Thread):
             try:
                 self.queue.put_nowait(frame)
             except:
-                # Queue full, drop frame (normal on Pi)
+                # Queue full, drop frame 
                 pass
 
 # ==================== DETECTION SYSTEM ====================
@@ -253,10 +253,10 @@ class DetectionSystem:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.connect(('8.8.8.8', 1))
                 ip = s.getsockname()[0]
-                print(f"📡 Stream URL: http://{ip}:{streaming_port}")
-                print(f"👥 Max concurrent viewers: {max_clients}")
+                print(f"Stream URL: http://{ip}:{streaming_port}")
+                print(f"Max concurrent viewers: {max_clients}")
             except:
-                print("📡 Stream URL: http://YOUR_PI_IP:{streaming_port}")
+                print("Stream URL: http://YOUR_PI_IP:{streaming_port}")
 
     def setup_logging(self):
         if self.config["system"]["log_to_file"]:
@@ -371,7 +371,7 @@ class DetectionSystem:
     def init_camera(self):
         print("Initializing camera...")
         try:
-            # Use the backend from config (now converted to OpenCV constant)
+            # Use the backend from config 
             backend = self.config['camera']['backend']
             
             self.cap = cv2.VideoCapture(self.config['camera']['device_id'], backend)
