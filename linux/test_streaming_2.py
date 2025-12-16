@@ -1,169 +1,112 @@
 #!/usr/bin/env python3
 """
-Fixed Camera Streamer - Working MJPEG streaming
+Fixed Camera Streamer with Direct OpenCV Capture
 """
 
-import subprocess
+import cv2
 import time
 import threading
 from flask import Flask, Response
 import signal
 import sys
 
-print("📷 FIXED CAMERA STREAMER")
+print("📷 OPENCV CAMERA STREAMER")
 print("="*60)
 
 app = Flask(__name__)
 
 # Global variables
-camera_process = None
-camera_running = False
-frame_buffer = []
-buffer_lock = threading.Lock()
+camera = None
+camera_lock = threading.Lock()
+output_frame = None
+frame_lock = threading.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-def find_jpeg_boundaries(data):
-    """Find JPEG frame boundaries in stream"""
-    frames = []
-    start = 0
+def capture_frames():
+    """Capture frames from camera in background thread"""
+    global camera, output_frame
+    
+    log("📡 Starting frame capture thread...")
     
     while True:
-        # Find JPEG start marker (FFD8)
-        jpeg_start = data.find(b'\xff\xd8', start)
-        if jpeg_start == -1:
-            break
-        
-        # Find JPEG end marker (FFD9)
-        jpeg_end = data.find(b'\xff\xd9', jpeg_start + 2)
-        if jpeg_end == -1:
-            break
-        
-        # Extract complete JPEG frame
-        frame = data[jpeg_start:jpeg_end + 2]
-        frames.append(frame)
-        start = jpeg_end + 2
-    
-    return frames
-
-def read_camera_stream():
-    """Read camera stream and buffer frames"""
-    global camera_process, frame_buffer
-    
-    log("📡 Starting frame reader thread...")
-    buffer = b''
-    
-    while camera_running and camera_process:
-        try:
-            # Read chunk from ffmpeg
-            chunk = camera_process.stdout.read(4096)
-            
-            if not chunk:
-                log("⚠️ No more data from camera")
+        with camera_lock:
+            if camera is None:
                 break
             
-            buffer += chunk
+            ret, frame = camera.read()
             
-            # Extract complete JPEG frames
-            frames = find_jpeg_boundaries(buffer)
-            
-            if frames:
-                with buffer_lock:
-                    # Keep only last 10 frames
-                    frame_buffer.extend(frames)
-                    frame_buffer = frame_buffer[-10:]
-                
-                # Remove processed frames from buffer
-                last_frame = frames[-1]
-                last_pos = buffer.rfind(last_frame) + len(last_frame)
-                buffer = buffer[last_pos:]
-                
-        except Exception as e:
-            log(f"❌ Reader error: {e}")
-            break
+            if not ret:
+                log("⚠️ Failed to read frame")
+                time.sleep(0.1)
+                continue
+        
+        # Encode frame as JPEG
+        ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        
+        if ret:
+            with frame_lock:
+                output_frame = jpeg.tobytes()
+        
+        time.sleep(0.033)  # ~30 FPS
     
-    log("📡 Frame reader stopped")
+    log("📡 Frame capture stopped")
 
 def start_camera():
-    global camera_process, camera_running, frame_buffer
-    
-    if camera_running and camera_process and camera_process.poll() is None:
-        return True
-    
-    if camera_process:
-        stop_camera()
+    global camera
     
     log("🚀 Starting camera...")
     
-    cmd = [
-        'ffmpeg',
-        '-f', 'v4l2',
-        '-input_format', 'mjpeg',
-        '-video_size', '640x480',
-        '-framerate', '15',
-        '-i', '/dev/video0',
-        '-f', 'mjpeg',
-        '-q:v', '5',  # Better quality
-        '-huffman', 'optimal',
-        '-'
-    ]
-    
-    try:
-        log(f"Running: {' '.join(cmd)}")
-        
-        camera_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0  # No buffering
-        )
-        
-        # Start stderr reader
-        def read_stderr():
-            for line in camera_process.stderr:
-                line_str = line.decode().strip()
-                if not line_str.startswith('frame='):
-                    log(f"FFMPEG: {line_str}")
-        
-        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-        stderr_thread.start()
-        
-        # Wait for startup
-        time.sleep(2)
-        
-        if camera_process.poll() is None:
-            camera_running = True
-            frame_buffer = []
-            
-            # Start frame reader thread
-            reader_thread = threading.Thread(target=read_camera_stream, daemon=True)
-            reader_thread.start()
-            
-            log("✅ Camera started successfully")
+    with camera_lock:
+        if camera is not None:
             return True
-        else:
-            log("❌ Camera failed to start")
+        
+        # Open camera with OpenCV
+        camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        
+        if not camera.isOpened():
+            log("❌ Failed to open camera")
+            camera = None
             return False
-            
-    except Exception as e:
-        log(f"❌ Error starting camera: {e}")
-        return False
+        
+        # Set camera properties
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        camera.set(cv2.CAP_PROP_FPS, 30)
+        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Get actual properties
+        width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = camera.get(cv2.CAP_PROP_FPS)
+        
+        log(f"✅ Camera opened: {width}x{height} @ {fps:.1f} FPS")
+    
+    # Start capture thread
+    capture_thread = threading.Thread(target=capture_frames, daemon=True)
+    capture_thread.start()
+    
+    # Wait for first frame
+    for i in range(50):  # Wait up to 5 seconds
+        time.sleep(0.1)
+        with frame_lock:
+            if output_frame is not None:
+                log("✅ First frame captured")
+                return True
+    
+    log("⚠️ No frames captured yet")
+    return True
 
 def stop_camera():
-    global camera_process, camera_running
-    if camera_process:
-        log("📴 Stopping camera...")
-        camera_running = False
-        try:
-            camera_process.terminate()
-            camera_process.wait(timeout=2)
-        except:
-            try:
-                camera_process.kill()
-            except:
-                pass
-        camera_process = None
+    global camera
+    log("📴 Stopping camera...")
+    
+    with camera_lock:
+        if camera is not None:
+            camera.release()
+            camera = None
 
 HTML = '''<!DOCTYPE html>
 <html>
@@ -199,6 +142,7 @@ HTML = '''<!DOCTYPE html>
             overflow: hidden;
             border: 2px solid #333;
             position: relative;
+            min-height: 480px;
         }
         
         #video-feed {
@@ -264,7 +208,7 @@ HTML = '''<!DOCTYPE html>
 </head>
 <body>
     <h1>📷 Raspberry Pi Camera Stream</h1>
-    <p class="subtitle">Live stream from /dev/video0</p>
+    <p class="subtitle">Live OpenCV stream from /dev/video0</p>
     
     <div class="video-container">
         <div id="loading">Loading camera feed...</div>
@@ -275,12 +219,18 @@ HTML = '''<!DOCTYPE html>
         <span class="live-indicator"></span>
         Status: <span id="status">Connecting...</span> | 
         FPS: <span id="fps">--</span> | 
+        Frames: <span id="frame-count">0</span> | 
         Time: <span id="timestamp">--:--:--</span>
     </div>
     
     <div class="controls">
         <button onclick="reloadStream()">🔄 Reload Stream</button>
         <button onclick="location.reload()">↻ Refresh Page</button>
+        <button onclick="checkStatus()">📊 Check Status</button>
+    </div>
+    
+    <div id="debug" style="background: rgba(255,255,255,0.1); padding: 10px; margin: 20px auto; max-width: 800px; font-family: monospace; font-size: 12px; display: none;">
+        Debug: <span id="debug-msg">--</span>
     </div>
     
     <script>
@@ -288,11 +238,22 @@ HTML = '''<!DOCTYPE html>
         const loading = document.getElementById('loading');
         const statusSpan = document.getElementById('status');
         const fpsSpan = document.getElementById('fps');
+        const frameCountSpan = document.getElementById('frame-count');
         const timestamp = document.getElementById('timestamp');
+        const debugDiv = document.getElementById('debug');
+        const debugMsg = document.getElementById('debug-msg');
         
         let frameCount = 0;
+        let totalFrames = 0;
         let lastFpsUpdate = Date.now();
         let streamLoaded = false;
+        let retryCount = 0;
+        
+        function debug(msg) {
+            console.log(msg);
+            debugMsg.textContent = msg;
+            debugDiv.style.display = 'block';
+        }
         
         function updateTime() {
             const now = new Date();
@@ -316,33 +277,56 @@ HTML = '''<!DOCTYPE html>
         }
         
         video.onload = function() {
+            debug('Frame loaded');
+            
             if (!streamLoaded) {
-                console.log('First frame loaded');
+                console.log('First frame loaded successfully');
                 streamLoaded = true;
                 loading.style.display = 'none';
                 video.style.display = 'block';
                 updateStatus('Live', '#4CAF50');
+                retryCount = 0;
             }
+            
             frameCount++;
+            totalFrames++;
+            frameCountSpan.textContent = totalFrames;
             updateFps();
         };
         
         video.onerror = function(e) {
             console.error('Video error:', e);
-            updateStatus('Error - Reconnecting...', '#ff4444');
-            loading.style.display = 'block';
-            loading.textContent = 'Connection lost. Reconnecting...';
+            debug('Error loading frame');
+            updateStatus('Error - Retrying...', '#ff4444');
             
-            setTimeout(() => {
-                reloadStream();
-            }, 2000);
+            retryCount++;
+            if (retryCount < 10) {
+                setTimeout(() => {
+                    debug('Retry ' + retryCount);
+                    reloadStream();
+                }, 2000);
+            } else {
+                updateStatus('Failed after 10 retries', '#ff0000');
+                loading.textContent = 'Stream failed. Please refresh page.';
+            }
         };
         
         function reloadStream() {
             console.log('Reloading stream...');
+            debug('Reloading stream...');
             updateStatus('Reloading...', '#ffaa00');
             streamLoaded = false;
             video.src = '/stream.mjpg?t=' + Date.now();
+        }
+        
+        function checkStatus() {
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    debug('Camera: ' + (data.camera_running ? 'ON' : 'OFF') + 
+                          ' | Frames: ' + data.frames_captured);
+                })
+                .catch(e => debug('Status check failed: ' + e));
         }
         
         // Update time every second
@@ -351,23 +335,17 @@ HTML = '''<!DOCTYPE html>
         
         // Start stream
         console.log('Starting stream...');
+        debug('Initializing...');
         video.src = '/stream.mjpg';
         
-        // Retry if not loaded after 10 seconds
+        // Retry if not loaded after 5 seconds
         setTimeout(() => {
             if (!streamLoaded) {
                 console.log('Stream timeout, retrying...');
+                debug('Timeout, retrying...');
                 reloadStream();
             }
-        }, 10000);
-        
-        // Keep-alive: reload every 60 seconds
-        setInterval(() => {
-            if (streamLoaded) {
-                console.log('Keep-alive: refreshing stream');
-                reloadStream();
-            }
-        }, 60000);
+        }, 5000);
     </script>
 </body>
 </html>'''
@@ -382,37 +360,39 @@ def stream():
         log("🎥 Client connected to stream")
         
         # Ensure camera is running
-        if not camera_running:
+        if camera is None:
             log("Starting camera for client")
             if not start_camera():
                 log("Failed to start camera")
                 return
-            time.sleep(2)  # Wait for frames
         
-        last_frame_idx = 0
+        frame_num = 0
         
         try:
             while True:
-                with buffer_lock:
-                    if len(frame_buffer) > last_frame_idx:
-                        # Get new frame
-                        frame = frame_buffer[-1]
-                        last_frame_idx = len(frame_buffer)
-                    else:
-                        frame = None
-                
-                if frame:
-                    # Send frame with proper MJPEG multipart format
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n'
-                           b'Content-Length: ' + str(len(frame)).encode() + b'\r\n'
-                           b'\r\n' + frame + b'\r\n')
-                else:
-                    # No new frame, wait a bit
-                    time.sleep(0.01)
+                # Get current frame
+                with frame_lock:
+                    if output_frame is None:
+                        time.sleep(0.01)
+                        continue
                     
+                    frame_bytes = output_frame
+                
+                # Send frame in multipart format
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n'
+                       b'\r\n' + frame_bytes + b'\r\n')
+                
+                frame_num += 1
+                
+                if frame_num % 100 == 0:
+                    log(f"📡 Sent {frame_num} frames to client")
+                
+                time.sleep(0.033)  # ~30 FPS
+                
         except GeneratorExit:
-            log("🎥 Client disconnected")
+            log(f"🎥 Client disconnected (sent {frame_num} frames)")
         except Exception as e:
             log(f"❌ Stream error: {e}")
     
@@ -423,19 +403,26 @@ def stream():
             'Cache-Control': 'no-cache, no-store, must-revalidate',
             'Pragma': 'no-cache',
             'Expires': '0',
-            'Connection': 'close'
+            'Connection': 'close',
+            'X-Accel-Buffering': 'no'
         }
     )
 
+frames_captured = 0
+
 @app.route('/status')
 def status():
-    with buffer_lock:
-        buffer_size = len(frame_buffer)
+    global frames_captured
+    
+    with frame_lock:
+        has_frame = output_frame is not None
+        if has_frame:
+            frames_captured += 1
     
     return {
-        'camera_running': camera_running,
-        'camera_alive': camera_process.poll() is None if camera_process else False,
-        'frames_buffered': buffer_size
+        'camera_running': camera is not None,
+        'has_frame': has_frame,
+        'frames_captured': frames_captured
     }
 
 def signal_handler(sig, frame):
@@ -447,7 +434,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     
     print("\n" + "="*70)
-    print("🚀 STARTING FIXED CAMERA STREAMER")
+    print("🚀 STARTING OPENCV CAMERA STREAMER")
     print("="*70)
     
     # Get IP
