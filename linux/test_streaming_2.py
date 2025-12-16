@@ -1,131 +1,203 @@
 #!/usr/bin/env python3
 """
-Ultra Simple Pi Camera Streamer
-Directly streams from ffmpeg to browser - no processing
+Simple Camera Streamer with Debug Mode
 """
 
 import subprocess
 import time
-from flask import Flask, Response, render_template_string
+import threading
+from flask import Flask, Response
 import signal
 import sys
 import os
 
-print("📷 ULTRA SIMPLE PI CAMERA STREAMER")
+print("📷 SIMPLE CAMERA STREAMER")
 print("="*60)
 
 app = Flask(__name__)
+
+# Global variables
 camera_process = None
+camera_running = False
+debug_mode = True
 
-def start_camera():
-    """Start ffmpeg to stream camera directly as MJPEG"""
-    global camera_process
+def log(msg):
+    """Simple logging"""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+def test_camera():
+    """Test if camera is accessible"""
+    log("🔍 Testing camera...")
     
+    # Try to list camera formats
+    cmd = ['v4l2-ctl', '--device=/dev/video0', '--list-formats']
     try:
-        print("🚀 Starting camera stream...")
-        
-        # Simple ffmpeg command that outputs MJPEG stream
-        cmd = [
-            'ffmpeg',
-            '-f', 'v4l2',
-            '-input_format', 'mjpeg',  # Many Pi cameras output MJPEG natively
-            '-video_size', '640x480',
-            '-framerate', '30',
-            '-i', '/dev/video0',
-            '-f', 'mjpeg',
-            '-q:v', '5',  # Quality: 2-31 (lower is better)
-            '-'
-        ]
-        
-        print(f"Running: {' '.join(cmd)}")
-        
-        camera_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=10**6
-        )
-        
-        # Read stderr in background to see errors
-        def read_stderr():
-            while True:
-                line = camera_process.stderr.readline()
-                if line:
-                    print(f"FFMPEG: {line.decode().strip()}")
-                else:
-                    break
-        
-        import threading
-        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-        stderr_thread.start()
-        
-        print("✅ Camera process started")
-        return True
-        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            log("✅ Camera formats:")
+            for line in result.stdout.split('\n'):
+                if line.strip():
+                    print(f"   {line}")
+            return True
+        else:
+            log(f"❌ v4l2-ctl failed: {result.stderr}")
+    except FileNotFoundError:
+        log("⚠️ v4l2-ctl not installed. Installing...")
+        subprocess.run(['sudo', 'apt', 'install', '-y', 'v4l-utils'])
+        return test_camera()
     except Exception as e:
-        print(f"❌ Failed to start camera: {e}")
-        return False
+        log(f"❌ Camera test error: {e}")
+    
+    return False
 
-def stop_camera():
-    """Stop the camera process"""
-    global camera_process
+def start_camera_stream():
+    """Start camera stream with retry logic"""
+    global camera_process, camera_running
+    
+    if camera_running and camera_process and camera_process.poll() is None:
+        log("⚠️ Camera already running")
+        return True
+    
+    # Stop any existing process
     if camera_process:
-        print("📴 Stopping camera...")
         camera_process.terminate()
         camera_process.wait()
-        camera_process = None
+    
+    log("🚀 Starting camera stream...")
+    
+    # Try different camera commands
+    commands_to_try = [
+        # Try 1: Simple MJPEG stream
+        [
+            'ffmpeg',
+            '-f', 'v4l2',
+            '-input_format', 'mjpeg',  # Many Pi cameras use MJPEG
+            '-video_size', '640x480',
+            '-framerate', '15',  # Lower FPS for stability
+            '-i', '/dev/video0',
+            '-f', 'mjpeg',
+            '-q:v', '5',
+            '-r', '15',  # Output framerate
+            '-'
+        ],
+        # Try 2: Without specifying input format
+        [
+            'ffmpeg',
+            '-f', 'v4l2',
+            '-video_size', '640x480',
+            '-framerate', '10',
+            '-i', '/dev/video0',
+            '-f', 'mjpeg',
+            '-q:v', '10',
+            '-r', '10',
+            '-'
+        ],
+        # Try 3: Very simple
+        [
+            'ffmpeg',
+            '-f', 'v4l2',
+            '-i', '/dev/video0',
+            '-f', 'mjpeg',
+            '-q:v', '10',
+            '-'
+        ]
+    ]
+    
+    for i, cmd in enumerate(commands_to_try, 1):
+        log(f"Trying command {i}/3: {' '.join(cmd[:6])}...")
+        
+        try:
+            camera_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE if debug_mode else subprocess.DEVNULL,
+                bufsize=10**6
+            )
+            
+            # Start stderr reader thread
+            if debug_mode:
+                def read_stderr():
+                    while True:
+                        line = camera_process.stderr.readline()
+                        if line:
+                            log(f"FFMPEG: {line.decode().strip()}")
+                        elif camera_process.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                
+                stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+                stderr_thread.start()
+            
+            # Wait a bit to see if it starts successfully
+            time.sleep(2)
+            
+            if camera_process.poll() is None:
+                camera_running = True
+                log(f"✅ Camera started with command {i}")
+                return True
+            else:
+                log(f"❌ Command {i} failed")
+                camera_process.terminate()
+                camera_process.wait()
+                
+        except Exception as e:
+            log(f"❌ Command {i} error: {e}")
+    
+    log("❌ All camera commands failed")
+    camera_running = False
+    return False
 
-# HTML Template
-HTML_TEMPLATE = '''
+def stop_camera():
+    """Stop camera stream"""
+    global camera_process, camera_running
+    
+    if camera_process:
+        log("📴 Stopping camera...")
+        camera_process.terminate()
+        try:
+            camera_process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            camera_process.kill()
+            camera_process.wait()
+        camera_process = None
+    
+    camera_running = False
+    log("✅ Camera stopped")
+
+# HTML page
+HTML = '''
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>📷 Pi Camera Live</title>
+    <title>Pi Camera Stream</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
         body {
-            font-family: 'Segoe UI', 'Roboto', sans-serif;
+            margin: 0;
+            padding: 20px;
             background: #0a0a0a;
             color: white;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 20px;
+            font-family: Arial, sans-serif;
+            text-align: center;
         }
         
         .header {
-            text-align: center;
-            margin-bottom: 30px;
-            padding: 20px;
+            margin-bottom: 20px;
         }
         
         h1 {
-            font-size: 2.5rem;
             color: #4CAF50;
             margin-bottom: 10px;
         }
         
-        .subtitle {
-            color: #aaa;
-            font-size: 1.1rem;
-        }
-        
         .video-container {
             max-width: 800px;
-            width: 100%;
+            margin: 0 auto 20px;
             background: black;
             border-radius: 10px;
             overflow: hidden;
             border: 2px solid #333;
-            margin-bottom: 20px;
         }
         
         #video-feed {
@@ -135,127 +207,192 @@ HTML_TEMPLATE = '''
         }
         
         .status {
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.1);
             padding: 15px;
             border-radius: 10px;
-            margin-top: 20px;
-            text-align: center;
+            margin: 20px auto;
+            max-width: 800px;
             font-family: monospace;
         }
         
         .controls {
-            margin-top: 20px;
-            display: flex;
-            gap: 10px;
+            margin: 20px 0;
         }
         
         button {
             background: #4CAF50;
             color: white;
             border: none;
-            padding: 10px 20px;
+            padding: 12px 24px;
             border-radius: 5px;
             cursor: pointer;
-            font-size: 1rem;
+            font-size: 16px;
+            margin: 0 10px;
         }
         
         button:hover {
             background: #45a049;
         }
         
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        
+        .log {
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid #333;
+            border-radius: 5px;
+            padding: 10px;
+            margin: 20px auto;
+            max-width: 800px;
+            max-height: 200px;
+            overflow-y: auto;
+            text-align: left;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        
         .error {
             color: #ff4444;
-            margin-top: 10px;
-            padding: 10px;
-            background: rgba(255, 68, 68, 0.1);
-            border-radius: 5px;
+            margin: 10px 0;
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>📷 Raspberry Pi Camera</h1>
-        <p class="subtitle">Live stream from /dev/video0</p>
+        <h1>📷 Raspberry Pi Camera Stream</h1>
+        <p>Direct stream from /dev/video0</p>
     </div>
     
     <div class="video-container">
-        <img id="video-feed" src="/video.mjpg" alt="Live Camera Feed">
+        <img id="video-feed" src="/stream.mjpg" alt="Live Camera Feed">
     </div>
     
     <div class="status">
-        <div>Stream: <span id="status">Loading...</span></div>
-        <div>Last update: <span id="time">--:--:--</span></div>
+        Status: <span id="status">Loading...</span> | 
+        Last update: <span id="timestamp">--:--:--</span>
     </div>
     
     <div class="controls">
-        <button onclick="reloadStream()">🔄 Reload Stream</button>
-        <button onclick="takeSnapshot()">📸 Take Snapshot</button>
+        <button onclick="reloadStream()" id="reload-btn">🔄 Reload Stream</button>
+        <button onclick="restartCamera()" id="restart-btn">🔄 Restart Camera</button>
+        <button onclick="location.reload()">↻ Refresh Page</button>
     </div>
     
-    <div id="error" class="error" style="display: none;"></div>
+    <div id="error" class="error"></div>
+    
+    <div class="log">
+        <div id="log-content">Connecting to camera...</div>
+    </div>
     
     <script>
-        const videoFeed = document.getElementById('video-feed');
+        const video = document.getElementById('video-feed');
         const status = document.getElementById('status');
-        const timeDisplay = document.getElementById('time');
+        const timestamp = document.getElementById('timestamp');
         const errorDiv = document.getElementById('error');
+        const logContent = document.getElementById('log-content');
+        const reloadBtn = document.getElementById('reload-btn');
+        const restartBtn = document.getElementById('restart-btn');
         
-        // Update time display
+        let connectionAttempts = 0;
+        const maxAttempts = 5;
+        
         function updateTime() {
             const now = new Date();
-            timeDisplay.textContent = now.toLocaleTimeString();
+            timestamp.textContent = now.toLocaleTimeString();
         }
         
+        function addLog(msg) {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString();
+            logContent.innerHTML = `[${timeStr}] ${msg}<br>` + logContent.innerHTML;
+        }
+        
+        function updateStatus(text, color) {
+            status.textContent = text;
+            status.style.color = color || 'white';
+        }
+        
+        video.onload = function() {
+            updateStatus('Live', '#4CAF50');
+            errorDiv.textContent = '';
+            connectionAttempts = 0;
+            addLog('Video stream loaded');
+        };
+        
+        video.onerror = function() {
+            connectionAttempts++;
+            
+            if (connectionAttempts >= maxAttempts) {
+                updateStatus('Error', '#ff4444');
+                errorDiv.textContent = `Failed to load stream after ${maxAttempts} attempts. Try restarting camera.`;
+                addLog('Stream error - max attempts reached');
+            } else {
+                updateStatus('Reconnecting...', '#ffaa00');
+                errorDiv.textContent = `Connection attempt ${connectionAttempts}/${maxAttempts}`;
+                addLog(`Connection attempt ${connectionAttempts} failed, retrying...`);
+                
+                // Exponential backoff
+                const delay = Math.min(1000 * Math.pow(2, connectionAttempts - 1), 10000);
+                
+                setTimeout(() => {
+                    video.src = '/stream.mjpg?t=' + Date.now();
+                }, delay);
+            }
+        };
+        
+        function reloadStream() {
+            reloadBtn.disabled = true;
+            updateStatus('Reloading...', '#ffaa00');
+            addLog('Manual reload requested');
+            
+            video.src = '/stream.mjpg?t=' + Date.now();
+            
+            setTimeout(() => {
+                reloadBtn.disabled = false;
+            }, 2000);
+        }
+        
+        function restartCamera() {
+            restartBtn.disabled = true;
+            updateStatus('Restarting camera...', '#ffaa00');
+            addLog('Camera restart requested');
+            
+            fetch('/restart')
+                .then(response => response.json())
+                .then(data => {
+                    addLog('Camera restart: ' + data.message);
+                    if (data.success) {
+                        setTimeout(() => {
+                            video.src = '/stream.mjpg?t=' + Date.now();
+                            restartBtn.disabled = false;
+                        }, 3000);
+                    } else {
+                        errorDiv.textContent = 'Failed to restart camera';
+                        restartBtn.disabled = false;
+                    }
+                })
+                .catch(error => {
+                    addLog('Restart error: ' + error);
+                    restartBtn.disabled = false;
+                });
+        }
+        
+        // Auto-refresh timestamp
         setInterval(updateTime, 1000);
         updateTime();
         
-        // Handle video load events
-        videoFeed.onload = function() {
-            status.textContent = 'Live';
-            status.style.color = '#4CAF50';
-            errorDiv.style.display = 'none';
-        };
-        
-        videoFeed.onerror = function() {
-            status.textContent = 'Error';
-            status.style.color = '#ff4444';
-            errorDiv.textContent = 'Failed to load stream. Trying again...';
-            errorDiv.style.display = 'block';
-            
-            // Try to reload after 2 seconds
-            setTimeout(() => {
-                videoFeed.src = '/video.mjpg?t=' + Date.now();
-            }, 2000);
-        };
-        
-        // Manual reload
-        function reloadStream() {
-            status.textContent = 'Reconnecting...';
-            status.style.color = '#ffaa00';
-            videoFeed.src = '/video.mjpg?t=' + Date.now();
-        }
-        
-        // Take snapshot
-        function takeSnapshot() {
-            const canvas = document.createElement('canvas');
-            canvas.width = videoFeed.videoWidth || 640;
-            canvas.height = videoFeed.videoHeight || 480;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(videoFeed, 0, 0);
-            
-            const link = document.createElement('a');
-            link.download = 'snapshot_' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
-            link.href = canvas.toDataURL('image/jpeg');
-            link.click();
-            
-            alert('Snapshot saved!');
-        }
-        
-        // Auto-reload every 30 seconds to prevent freezing
-        setInterval(reloadStream, 30000);
-        
         // Initial load
-        videoFeed.src = '/video.mjpg?t=' + Date.now();
+        video.src = '/stream.mjpg?t=' + Date.now();
+        
+        // Auto-reload stream every 30 seconds
+        setInterval(() => {
+            if (status.textContent === 'Live') {
+                addLog('Auto-reloading stream...');
+                video.src = '/stream.mjpg?t=' + Date.now();
+            }
+        }, 30000);
     </script>
 </body>
 </html>
@@ -263,44 +400,50 @@ HTML_TEMPLATE = '''
 
 @app.route('/')
 def index():
-    """Main page"""
-    return render_template_string(HTML_TEMPLATE)
+    return HTML
 
-@app.route('/video.mjpg')
-def video_feed():
-    """Stream camera directly from ffmpeg"""
+@app.route('/stream.mjpg')
+def stream():
     def generate():
         try:
-            # Check if camera process is running
-            if not camera_process or camera_process.poll() is not None:
-                print("⚠️ Camera process not running, restarting...")
-                start_camera()
-                time.sleep(1)  # Give it time to start
+            # Ensure camera is running
+            if not camera_running or camera_process is None or camera_process.poll() is not None:
+                log("⚠️ Camera not running, attempting to start...")
+                start_camera_stream()
+                time.sleep(2)  # Give it time to start
             
-            # Stream ffmpeg output directly to browser
-            while True:
-                if camera_process and camera_process.stdout:
-                    # Read chunk from ffmpeg
-                    chunk = camera_process.stdout.read(1024)
-                    if chunk:
-                        yield chunk
+            if camera_running and camera_process and camera_process.poll() is None:
+                log("🎥 Starting stream to client")
+                
+                # Stream directly from ffmpeg
+                while True:
+                    if camera_process and camera_process.stdout:
+                        chunk = camera_process.stdout.read(1024)
+                        if chunk:
+                            yield chunk
+                        else:
+                            log("⚠️ No data from camera")
+                            break
                     else:
-                        # No data, try to restart
-                        print("⚠️ No data from camera, restarting...")
-                        stop_camera()
-                        start_camera()
-                        time.sleep(2)
+                        log("⚠️ Camera process not available")
                         break
-                else:
-                    print("⚠️ Camera process not available")
-                    time.sleep(1)
-                    break
-                    
+                
+                log("🎥 Stream ended")
+            else:
+                log("❌ Cannot stream: camera not available")
+                
+                # Send error image
+                error_img = create_error_image("Camera Not Available")
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + 
+                       error_img + b'\r\n')
+                
         except Exception as e:
-            print(f"❌ Stream error: {e}")
-            # Return an error image
-            error_img = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + get_error_image() + b'\r\n'
-            yield error_img
+            log(f"❌ Stream error: {e}")
+            error_img = create_error_image(f"Error: {str(e)[:50]}")
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + 
+                   error_img + b'\r\n')
     
     return Response(generate(),
                    mimetype='multipart/x-mixed-replace; boundary=frame',
@@ -310,28 +453,61 @@ def video_feed():
                        'Expires': '0'
                    })
 
-def get_error_image():
+@app.route('/restart')
+def restart():
+    """Restart camera endpoint"""
+    log("🔄 Manual restart requested")
+    stop_camera()
+    success = start_camera_stream()
+    
+    return {
+        'success': success,
+        'message': 'Camera restarted' if success else 'Failed to restart camera'
+    }
+
+def create_error_image(message):
     """Create a simple error image"""
-    from PIL import Image, ImageDraw
-    import io
-    
-    img = Image.new('RGB', (640, 480), color='black')
-    draw = ImageDraw.Draw(img)
-    
-    # Simple text without font
-    draw.text((200, 200), "CAMERA ERROR", fill='white')
-    draw.text((180, 230), "Check /dev/video0", fill='red')
-    
-    # Save to bytes
-    buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=80)
-    return buf.getvalue()
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+        
+        img = Image.new('RGB', (640, 480), color='black')
+        draw = ImageDraw.Draw(img)
+        
+        # Try to load a font
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        except:
+            font = ImageFont.load_default()
+        
+        # Draw error message
+        draw.text((50, 200), message, fill='red', font=font)
+        draw.text((50, 250), "Check /dev/video0 connection", fill='white', font=font)
+        
+        # Save to bytes
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=80)
+        return buf.getvalue()
+        
+    except ImportError:
+        # If PIL is not available, return a simple colored image
+        import struct
+        # Create a simple red gradient
+        width, height = 640, 480
+        data = b''
+        for y in range(height):
+            for x in range(width):
+                r = 255 if y < height//2 else 128
+                g = 0
+                b = 0
+                data += struct.pack('BBB', r, g, b)
+        return data
 
 def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    print("\n\n🛑 Stopping camera streamer...")
+    """Handle Ctrl+C"""
+    log("\n🛑 Stopping camera streamer...")
     stop_camera()
-    print("✅ Cleanup complete")
+    log("✅ Cleanup complete")
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -339,41 +515,40 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     
     print("\n" + "="*70)
-    print("🚀 STARTING ULTRA SIMPLE CAMERA STREAMER")
+    print("🚀 SIMPLE CAMERA STREAMER")
     print("="*70)
     
-    # First, let's test the camera directly
-    print("\n🔍 Testing camera with simple command...")
-    test_cmd = ['ffmpeg', '-f', 'v4l2', '-list_formats', 'all', '-i', '/dev/video0']
-    try:
-        result = subprocess.run(test_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print("✅ Camera device found")
-            print("Supported formats:")
-            for line in result.stderr.split('\n'):
-                if 'v4l2' in line or 'mjpeg' in line or 'yuyv' in line:
-                    print(f"  {line.strip()}")
-        else:
-            print("❌ Cannot access camera device")
-            print(f"Error: {result.stderr}")
-    except Exception as e:
-        print(f"❌ Error testing camera: {e}")
+    # Check dependencies
+    log("Checking dependencies...")
+    dependencies = ['ffmpeg']
+    missing_deps = []
     
-    # Try alternative camera device
-    print("\n🔍 Looking for camera devices...")
-    import glob
-    video_devices = glob.glob('/dev/video*')
-    print(f"Found devices: {video_devices}")
+    for dep in dependencies:
+        try:
+            subprocess.run([dep, '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log(f"✅ {dep} is installed")
+        except FileNotFoundError:
+            log(f"❌ {dep} not found")
+            missing_deps.append(dep)
     
-    # Try to start camera
-    camera_started = start_camera()
+    if missing_deps:
+        log(f"\n⚠️  Missing: {', '.join(missing_deps)}")
+        log("Install with: sudo apt update && sudo apt install ffmpeg")
+        response = input("Install now? (y/n): ")
+        if response.lower() == 'y':
+            subprocess.run(['sudo', 'apt', 'update'])
+            subprocess.run(['sudo', 'apt', 'install', '-y'] + missing_deps)
     
-    if not camera_started:
-        print("\n⚠️  Could not start camera. Using fallback...")
+    # Test camera
+    if not test_camera():
+        log("⚠️  Camera test failed, but continuing anyway...")
+    
+    # Start camera
+    start_camera_stream()
     
     # Get IP address
+    import socket
     try:
-        import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 1))
         local_ip = s.getsockname()[0]
@@ -383,12 +558,11 @@ if __name__ == "__main__":
     print(f"\n🌐 Stream available at:")
     print(f"   • http://localhost:5000")
     print(f"   • http://{local_ip}:5000")
-    print("\n📹 If you see 'CAMERA ERROR', check:")
-    print("   1. Camera is connected: ls /dev/video*")
-    print("   2. Permissions: sudo chmod 666 /dev/video0")
-    print("   3. Try: ffplay -f v4l2 /dev/video0")
-    print("🛑 Press Ctrl+C to stop")
+    print("\n🔧 Debug info:")
+    print(f"   • Camera running: {camera_running}")
+    print(f"   • Debug mode: {debug_mode}")
+    print("\n🛑 Press Ctrl+C to stop")
     print("="*70 + "\n")
     
     # Run Flask
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, use_reloader=False)
