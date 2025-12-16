@@ -1,226 +1,79 @@
 #!/usr/bin/env python3
 """
-Simple Pi Camera Streamer - No OpenCV Required
-Streams Raspberry Pi camera to a clean webpage using ffmpeg and PIL.
+Ultra Simple Pi Camera Streamer
+Directly streams from ffmpeg to browser - no processing
 """
 
-import time
 import subprocess
-import threading
+import time
 from flask import Flask, Response, render_template_string
 import signal
 import sys
 import os
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np
 
-print("📷 SIMPLE PI CAMERA STREAMER (No OpenCV)")
+print("📷 ULTRA SIMPLE PI CAMERA STREAMER")
 print("="*60)
 
-class PiCameraStreamer:
-    def __init__(self, width=640, height=480, fps=30):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.camera_process = None
-        self.latest_frame = None
-        self.frame_lock = threading.Lock()
-        self.running = False
-        self.frame_count = 0
-        
-        # Try to load a font, fall back to default
-        try:
-            self.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
-        except:
-            self.font = ImageFont.load_default()
-        
-        print(f"📹 Camera: {width}x{height} @ {fps}fps")
-    
-    def start_camera(self):
-        """Start the camera using ffmpeg command"""
-        try:
-            # FFMPEG command to capture from camera and output JPEG
-            cmd = [
-                'ffmpeg',
-                '-f', 'v4l2',
-                '-framerate', str(self.fps),
-                '-video_size', f'{self.width}x{self.height}',
-                '-i', '/dev/video0',
-                '-f', 'image2pipe',
-                '-vf', 'format=yuv420p',
-                '-vcodec', 'mjpeg',
-                '-q:v', '2',  # Quality factor (2-31, lower is better)
-                '-'
-            ]
-            
-            print(f"🚀 Starting camera: {' '.join(cmd[:10])}...")
-            self.camera_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=10**6  # 1MB buffer
-            )
-            
-            self.running = True
-            self.read_thread = threading.Thread(target=self.read_frames, daemon=True)
-            self.read_thread.start()
-            
-            print("✅ Camera started successfully")
-            
-        except Exception as e:
-            print(f"❌ Failed to start camera: {e}")
-            print("\n🔧 Troubleshooting:")
-            print("   1. Check camera is connected: ls /dev/video*")
-            print("   2. Try: ffplay -f v4l2 -video_size 640x480 /dev/video0")
-            print("   3. Install ffmpeg: sudo apt install ffmpeg")
-            print("   4. Install PIL: pip3 install Pillow")
-            
-            # Create a test pattern if camera fails
-            self.create_test_pattern()
-    
-    def create_test_pattern(self):
-        """Create a test pattern if camera fails"""
-        print("⚠️  Creating test pattern (camera not available)")
-        self.running = True
-        self.test_thread = threading.Thread(target=self.generate_test_pattern, daemon=True)
-        self.test_thread.start()
-    
-    def generate_test_pattern(self):
-        """Generate a moving test pattern using PIL"""
-        while self.running:
-            # Create a new image
-            img = Image.new('RGB', (self.width, self.height), color='black')
-            draw = ImageDraw.Draw(img)
-            
-            # Add moving elements
-            t = time.time()
-            center_x = self.width // 2
-            center_y = self.height // 2
-            radius = min(self.width, self.height) // 4
-            
-            # Moving circle
-            x = int(center_x + radius * np.sin(t))
-            y = int(center_y + radius * np.cos(t * 0.7))
-            
-            # Draw circle
-            draw.ellipse([x-30, y-30, x+30, y+30], fill=(0, 200, 255))
-            
-            # Add timestamp
-            timestamp = time.strftime("%H:%M:%S")
-            draw.text((10, 10), f"TEST MODE - {timestamp}", fill=(255, 255, 255), font=self.font)
-            draw.text((10, 40), "Camera not detected", fill=(200, 200, 200), font=self.font)
-            draw.text((10, 70), "Check /dev/video0 connection", fill=(200, 200, 200), font=self.font)
-            
-            # Add frame counter
-            self.frame_count += 1
-            draw.text((self.width - 150, 10), f"Frame: {self.frame_count}", fill=(150, 150, 150), font=self.font)
-            
-            # Convert to bytes
-            with BytesIO() as output:
-                img.save(output, format='JPEG', quality=85)
-                jpeg_data = output.getvalue()
-            
-            with self.frame_lock:
-                self.latest_frame = jpeg_data
-            
-            time.sleep(1/self.fps)
-    
-    def read_frames(self):
-        """Read JPEG frames from ffmpeg process"""
-        print(f"📥 Reading JPEG frames from camera...")
-        
-        # Read JPEG frames from ffmpeg output
-        while self.running and self.camera_process:
-            try:
-                # FFmpeg outputs JPEG frames with markers
-                # Look for JPEG start marker (0xFF 0xD8)
-                while True:
-                    # Read until we find start of JPEG
-                    byte = self.camera_process.stdout.read(1)
-                    if not byte:
-                        break
-                    
-                    if ord(byte) == 0xFF:
-                        next_byte = self.camera_process.stdout.read(1)
-                        if next_byte and ord(next_byte) == 0xD8:
-                            # Found JPEG start, now read the rest
-                            jpeg_data = byte + next_byte
-                            
-                            # Read until we find JPEG end marker (0xFF 0xD9)
-                            while True:
-                                chunk = self.camera_process.stdout.read(1024)
-                                if not chunk:
-                                    break
-                                jpeg_data += chunk
-                                
-                                # Check if we have the end marker
-                                if len(jpeg_data) >= 2 and jpeg_data[-2:] == b'\xFF\xD9':
-                                    # Complete JPEG frame
-                                    
-                                    # Add timestamp overlay using PIL
-                                    img = Image.open(BytesIO(jpeg_data))
-                                    draw = ImageDraw.Draw(img)
-                                    
-                                    # Add timestamp
-                                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                                    draw.text((10, 10), timestamp, fill=(255, 255, 255), font=self.font)
-                                    
-                                    # Add resolution info
-                                    info_text = f"{self.width}x{self.height} @ {self.fps}fps"
-                                    draw.text((10, 40), info_text, fill=(200, 200, 255), font=self.font)
-                                    
-                                    # Save back to JPEG
-                                    with BytesIO() as output:
-                                        img.save(output, format='JPEG', quality=85)
-                                        jpeg_data = output.getvalue()
-                                    
-                                    with self.frame_lock:
-                                        self.latest_frame = jpeg_data
-                                    
-                                    self.frame_count += 1
-                                    break
-                            
-                            break  # Exit the byte reading loop to get next frame
-                
-                # Small sleep to prevent busy waiting
-                time.sleep(0.001)
-                    
-            except Exception as e:
-                print(f"⚠️  Error reading frame: {e}")
-                break
-        
-        print("📴 Camera feed ended")
-    
-    def get_frame(self):
-        """Get the latest frame as JPEG bytes"""
-        with self.frame_lock:
-            if self.latest_frame is not None:
-                return self.latest_frame
-        
-        # Return a placeholder frame
-        img = Image.new('RGB', (self.width, self.height), color='black')
-        draw = ImageDraw.Draw(img)
-        draw.text((self.width//2 - 150, self.height//2 - 20), 
-                 "NO CAMERA FEED", fill=(255, 255, 255), font=self.font)
-        
-        with BytesIO() as output:
-            img.save(output, format='JPEG', quality=85)
-            return output.getvalue()
-    
-    def stop(self):
-        """Stop the camera"""
-        self.running = False
-        if self.camera_process:
-            self.camera_process.terminate()
-            self.camera_process.wait()
-        print("📴 Camera stopped")
-
-# Create Flask app
 app = Flask(__name__)
+camera_process = None
 
-# Initialize camera
-camera = PiCameraStreamer(width=640, height=480, fps=30)
+def start_camera():
+    """Start ffmpeg to stream camera directly as MJPEG"""
+    global camera_process
+    
+    try:
+        print("🚀 Starting camera stream...")
+        
+        # Simple ffmpeg command that outputs MJPEG stream
+        cmd = [
+            'ffmpeg',
+            '-f', 'v4l2',
+            '-input_format', 'mjpeg',  # Many Pi cameras output MJPEG natively
+            '-video_size', '640x480',
+            '-framerate', '30',
+            '-i', '/dev/video0',
+            '-f', 'mjpeg',
+            '-q:v', '5',  # Quality: 2-31 (lower is better)
+            '-'
+        ]
+        
+        print(f"Running: {' '.join(cmd)}")
+        
+        camera_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=10**6
+        )
+        
+        # Read stderr in background to see errors
+        def read_stderr():
+            while True:
+                line = camera_process.stderr.readline()
+                if line:
+                    print(f"FFMPEG: {line.decode().strip()}")
+                else:
+                    break
+        
+        import threading
+        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        stderr_thread.start()
+        
+        print("✅ Camera process started")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to start camera: {e}")
+        return False
+
+def stop_camera():
+    """Stop the camera process"""
+    global camera_process
+    if camera_process:
+        print("📴 Stopping camera...")
+        camera_process.terminate()
+        camera_process.wait()
+        camera_process = None
 
 # HTML Template
 HTML_TEMPLATE = '''
@@ -229,8 +82,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>📷 Raspberry Pi Camera</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <title>📷 Pi Camera Live</title>
     <style>
         * {
             margin: 0;
@@ -240,8 +92,8 @@ HTML_TEMPLATE = '''
         
         body {
             font-family: 'Segoe UI', 'Roboto', sans-serif;
-            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 100%);
-            color: #f0f0f0;
+            background: #0a0a0a;
+            color: white;
             min-height: 100vh;
             display: flex;
             flex-direction: column;
@@ -249,259 +101,161 @@ HTML_TEMPLATE = '''
             padding: 20px;
         }
         
-        .container {
-            max-width: 1200px;
-            width: 100%;
-        }
-        
-        header {
+        .header {
             text-align: center;
             margin-bottom: 30px;
             padding: 20px;
-            animation: fadeIn 0.8s ease-out;
         }
         
         h1 {
             font-size: 2.5rem;
+            color: #4CAF50;
             margin-bottom: 10px;
-            background: linear-gradient(90deg, #4CAF50, #2196F3);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
         }
         
         .subtitle {
             color: #aaa;
             font-size: 1.1rem;
-            margin-bottom: 20px;
         }
         
         .video-container {
-            background: rgba(0, 0, 0, 0.5);
-            border-radius: 15px;
-            padding: 20px;
-            margin-bottom: 30px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-            animation: fadeIn 1s ease-out;
-            display: flex;
-            justify-content: center;
-        }
-        
-        .video-wrapper {
-            position: relative;
-            border-radius: 10px;
-            overflow: hidden;
             max-width: 800px;
             width: 100%;
-            aspect-ratio: 4/3;
+            background: black;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 2px solid #333;
+            margin-bottom: 20px;
         }
         
         #video-feed {
             width: 100%;
-            height: 100%;
-            object-fit: cover;
+            height: auto;
             display: block;
         }
         
-        .loading {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.8);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            animation: fadeIn 0.5s ease-out;
-        }
-        
-        .spinner {
-            width: 50px;
-            height: 50px;
-            border: 4px solid rgba(255, 255, 255, 0.1);
-            border-top: 4px solid #4CAF50;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-bottom: 20px;
-        }
-        
-        .status-bar {
-            display: flex;
-            justify-content: center;
-            gap: 20px;
-            flex-wrap: wrap;
-            margin-bottom: 20px;
-            animation: fadeIn 1.2s ease-out;
-        }
-        
-        .status-item {
+        .status {
             background: rgba(255, 255, 255, 0.05);
-            padding: 15px 25px;
+            padding: 15px;
             border-radius: 10px;
-            border-left: 4px solid #4CAF50;
-            min-width: 200px;
+            margin-top: 20px;
             text-align: center;
-            transition: transform 0.3s;
+            font-family: monospace;
         }
         
-        .status-item:hover {
-            transform: translateY(-5px);
-            background: rgba(255, 255, 255, 0.08);
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
         }
         
-        .status-item i {
-            font-size: 1.5rem;
-            color: #4CAF50;
-            margin-bottom: 10px;
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1rem;
         }
         
-        .status-label {
-            font-size: 0.9rem;
-            color: #aaa;
-            margin-bottom: 5px;
+        button:hover {
+            background: #45a049;
         }
         
-        .status-value {
-            font-size: 1.5rem;
-            font-weight: bold;
-        }
-        
-        footer {
-            text-align: center;
-            color: #666;
-            padding: 20px;
-            margin-top: auto;
-            animation: fadeIn 1.4s ease-out;
-        }
-        
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        
-        @media (max-width: 768px) {
-            h1 {
-                font-size: 2rem;
-            }
-            
-            .status-bar {
-                flex-direction: column;
-                align-items: center;
-            }
-            
-            .status-item {
-                width: 100%;
-                max-width: 300px;
-            }
+        .error {
+            color: #ff4444;
+            margin-top: 10px;
+            padding: 10px;
+            background: rgba(255, 68, 68, 0.1);
+            border-radius: 5px;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1><i class="fas fa-camera"></i> Raspberry Pi Camera</h1>
-            <p class="subtitle">Live streaming from Raspberry Pi Camera Module</p>
-        </header>
-        
-        <div class="video-container">
-            <div class="video-wrapper">
-                <img id="video-feed" src="/video_feed" alt="Live Camera Feed">
-                <div class="loading" id="loading">
-                    <div class="spinner"></div>
-                    <p>Connecting to camera...</p>
-                </div>
-            </div>
-        </div>
-        
-        <div class="status-bar">
-            <div class="status-item">
-                <i class="fas fa-video"></i>
-                <div class="status-label">Resolution</div>
-                <div class="status-value" id="resolution">640x480</div>
-            </div>
-            <div class="status-item">
-                <i class="fas fa-tachometer-alt"></i>
-                <div class="status-label">Frame Rate</div>
-                <div class="status-value" id="fps">30 fps</div>
-            </div>
-            <div class="status-item">
-                <i class="fas fa-clock"></i>
-                <div class="status-label">Uptime</div>
-                <div class="status-value" id="uptime">0:00</div>
-            </div>
-        </div>
-        
-        <footer>
-            <p><i class="fas fa-microchip"></i> Raspberry Pi Camera Streamer</p>
-            <p>Streaming from /dev/video0 | No OpenCV Required</p>
-        </footer>
+    <div class="header">
+        <h1>📷 Raspberry Pi Camera</h1>
+        <p class="subtitle">Live stream from /dev/video0</p>
     </div>
     
+    <div class="video-container">
+        <img id="video-feed" src="/video.mjpg" alt="Live Camera Feed">
+    </div>
+    
+    <div class="status">
+        <div>Stream: <span id="status">Loading...</span></div>
+        <div>Last update: <span id="time">--:--:--</span></div>
+    </div>
+    
+    <div class="controls">
+        <button onclick="reloadStream()">🔄 Reload Stream</button>
+        <button onclick="takeSnapshot()">📸 Take Snapshot</button>
+    </div>
+    
+    <div id="error" class="error" style="display: none;"></div>
+    
     <script>
-        // Hide loading screen when video loads
         const videoFeed = document.getElementById('video-feed');
-        const loading = document.getElementById('loading');
+        const status = document.getElementById('status');
+        const timeDisplay = document.getElementById('time');
+        const errorDiv = document.getElementById('error');
         
+        // Update time display
+        function updateTime() {
+            const now = new Date();
+            timeDisplay.textContent = now.toLocaleTimeString();
+        }
+        
+        setInterval(updateTime, 1000);
+        updateTime();
+        
+        // Handle video load events
         videoFeed.onload = function() {
-            loading.style.display = 'none';
+            status.textContent = 'Live';
+            status.style.color = '#4CAF50';
+            errorDiv.style.display = 'none';
         };
         
         videoFeed.onerror = function() {
-            // If error, reload the feed
-            loading.style.display = 'flex';
+            status.textContent = 'Error';
+            status.style.color = '#ff4444';
+            errorDiv.textContent = 'Failed to load stream. Trying again...';
+            errorDiv.style.display = 'block';
+            
+            // Try to reload after 2 seconds
             setTimeout(() => {
-                this.src = '/video_feed?' + new Date().getTime();
-            }, 1000);
+                videoFeed.src = '/video.mjpg?t=' + Date.now();
+            }, 2000);
         };
         
-        // Update uptime counter
-        let startTime = Date.now();
-        function updateUptime() {
-            const elapsed = Date.now() - startTime;
-            const seconds = Math.floor(elapsed / 1000);
-            const minutes = Math.floor(seconds / 60);
-            const hours = Math.floor(minutes / 60);
-            
-            let uptimeText = '';
-            if (hours > 0) {
-                uptimeText = hours + ':' + (minutes % 60).toString().padStart(2, '0') + ':' + (seconds % 60).toString().padStart(2, '0');
-            } else {
-                uptimeText = minutes + ':' + (seconds % 60).toString().padStart(2, '0');
-            }
-            
-            document.getElementById('uptime').textContent = uptimeText;
+        // Manual reload
+        function reloadStream() {
+            status.textContent = 'Reconnecting...';
+            status.style.color = '#ffaa00';
+            videoFeed.src = '/video.mjpg?t=' + Date.now();
         }
         
-        // Update uptime every second
-        setInterval(updateUptime, 1000);
-        updateUptime(); // Initial update
+        // Take snapshot
+        function takeSnapshot() {
+            const canvas = document.createElement('canvas');
+            canvas.width = videoFeed.videoWidth || 640;
+            canvas.height = videoFeed.videoHeight || 480;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(videoFeed, 0, 0);
+            
+            const link = document.createElement('a');
+            link.download = 'snapshot_' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
+            link.href = canvas.toDataURL('image/jpeg');
+            link.click();
+            
+            alert('Snapshot saved!');
+        }
         
-        // Handle page visibility
-        document.addEventListener('visibilitychange', function() {
-            if (!document.hidden) {
-                // Page is visible again, reload video feed
-                loading.style.display = 'flex';
-                videoFeed.src = '/video_feed?' + new Date().getTime();
-            }
-        });
+        // Auto-reload every 30 seconds to prevent freezing
+        setInterval(reloadStream, 30000);
         
-        // Auto-reload feed every 3 seconds to prevent freezing
-        setInterval(function() {
-            videoFeed.src = '/video_feed?' + new Date().getTime();
-        }, 3000);
+        // Initial load
+        videoFeed.src = '/video.mjpg?t=' + Date.now();
     </script>
 </body>
 </html>
@@ -512,52 +266,41 @@ def index():
     """Main page"""
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/video_feed')
+@app.route('/video.mjpg')
 def video_feed():
-    """Video streaming route - serves JPEG frames"""
+    """Stream camera directly from ffmpeg"""
     def generate():
-        last_time = time.time()
-        frame_interval = 1/30  # Target 30 FPS
-        
-        while True:
-            try:
-                # Get current time
-                current_time = time.time()
-                
-                # Control frame rate
-                elapsed = current_time - last_time
-                if elapsed < frame_interval:
-                    time.sleep(frame_interval - elapsed)
-                
-                # Get JPEG frame from camera
-                jpeg_data = camera.get_frame()
-                
-                # Send the frame
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + 
-                       jpeg_data + b'\r\n')
-                
-                last_time = time.time()
-                
-            except Exception as e:
-                print(f"⚠️  Stream error: {e}")
-                # Create error image
-                img = Image.new('RGB', (640, 480), color='black')
-                draw = ImageDraw.Draw(img)
-                try:
-                    draw.text((200, 200), "STREAM ERROR", fill=(255, 255, 255), font=camera.font)
-                except:
-                    pass
-                
-                with BytesIO() as output:
-                    img.save(output, format='JPEG', quality=85)
-                    error_frame = output.getvalue()
-                
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + 
-                       error_frame + b'\r\n')
-                
-                time.sleep(1)  # Wait before retrying
+        try:
+            # Check if camera process is running
+            if not camera_process or camera_process.poll() is not None:
+                print("⚠️ Camera process not running, restarting...")
+                start_camera()
+                time.sleep(1)  # Give it time to start
+            
+            # Stream ffmpeg output directly to browser
+            while True:
+                if camera_process and camera_process.stdout:
+                    # Read chunk from ffmpeg
+                    chunk = camera_process.stdout.read(1024)
+                    if chunk:
+                        yield chunk
+                    else:
+                        # No data, try to restart
+                        print("⚠️ No data from camera, restarting...")
+                        stop_camera()
+                        start_camera()
+                        time.sleep(2)
+                        break
+                else:
+                    print("⚠️ Camera process not available")
+                    time.sleep(1)
+                    break
+                    
+        except Exception as e:
+            print(f"❌ Stream error: {e}")
+            # Return an error image
+            error_img = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + get_error_image() + b'\r\n'
+            yield error_img
     
     return Response(generate(),
                    mimetype='multipart/x-mixed-replace; boundary=frame',
@@ -567,52 +310,70 @@ def video_feed():
                        'Expires': '0'
                    })
 
+def get_error_image():
+    """Create a simple error image"""
+    from PIL import Image, ImageDraw
+    import io
+    
+    img = Image.new('RGB', (640, 480), color='black')
+    draw = ImageDraw.Draw(img)
+    
+    # Simple text without font
+    draw.text((200, 200), "CAMERA ERROR", fill='white')
+    draw.text((180, 230), "Check /dev/video0", fill='red')
+    
+    # Save to bytes
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=80)
+    return buf.getvalue()
+
 def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully"""
     print("\n\n🛑 Stopping camera streamer...")
-    camera.stop()
+    stop_camera()
     print("✅ Cleanup complete")
     sys.exit(0)
 
 if __name__ == "__main__":
-    # Setup signal handler for Ctrl+C
+    # Setup signal handler
     signal.signal(signal.SIGINT, signal_handler)
     
     print("\n" + "="*70)
-    print("🚀 STARTING PI CAMERA STREAMER (No OpenCV)")
+    print("🚀 STARTING ULTRA SIMPLE CAMERA STREAMER")
     print("="*70)
     
-    # Install instructions
-    print("\n📦 Dependencies needed:")
-    print("   1. ffmpeg: sudo apt install ffmpeg")
-    print("   2. Pillow: pip3 install Pillow")
-    print("   3. Flask: pip3 install flask")
-    print("   4. numpy: pip3 install numpy")
-    
-    # Check dependencies
+    # First, let's test the camera directly
+    print("\n🔍 Testing camera with simple command...")
+    test_cmd = ['ffmpeg', '-f', 'v4l2', '-list_formats', 'all', '-i', '/dev/video0']
     try:
-        from PIL import Image
-        print("✅ Pillow is installed")
-    except ImportError:
-        print("❌ Pillow not installed. Run: pip3 install Pillow")
-        sys.exit(1)
+        result = subprocess.run(test_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print("✅ Camera device found")
+            print("Supported formats:")
+            for line in result.stderr.split('\n'):
+                if 'v4l2' in line or 'mjpeg' in line or 'yuyv' in line:
+                    print(f"  {line.strip()}")
+        else:
+            print("❌ Cannot access camera device")
+            print(f"Error: {result.stderr}")
+    except Exception as e:
+        print(f"❌ Error testing camera: {e}")
     
+    # Try alternative camera device
+    print("\n🔍 Looking for camera devices...")
+    import glob
+    video_devices = glob.glob('/dev/video*')
+    print(f"Found devices: {video_devices}")
+    
+    # Try to start camera
+    camera_started = start_camera()
+    
+    if not camera_started:
+        print("\n⚠️  Could not start camera. Using fallback...")
+    
+    # Get IP address
     try:
-        import flask
-        print("✅ Flask is installed")
-    except ImportError:
-        print("❌ Flask not installed. Run: pip3 install flask")
-        sys.exit(1)
-    
-    # Start camera
-    camera.start_camera()
-    
-    # Give camera time to start
-    time.sleep(2)
-    
-    # Get local IP address
-    import socket
-    try:
+        import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 1))
         local_ip = s.getsockname()[0]
@@ -622,9 +383,12 @@ if __name__ == "__main__":
     print(f"\n🌐 Stream available at:")
     print(f"   • http://localhost:5000")
     print(f"   • http://{local_ip}:5000")
-    print("\n📹 Camera should appear in 3-5 seconds")
+    print("\n📹 If you see 'CAMERA ERROR', check:")
+    print("   1. Camera is connected: ls /dev/video*")
+    print("   2. Permissions: sudo chmod 666 /dev/video0")
+    print("   3. Try: ffplay -f v4l2 /dev/video0")
     print("🛑 Press Ctrl+C to stop")
     print("="*70 + "\n")
     
-    # Run Flask app
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True, use_reloader=False)
+    # Run Flask
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
