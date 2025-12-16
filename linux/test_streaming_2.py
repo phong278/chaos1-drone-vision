@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Working Camera Streamer - Fixed MJPEG streaming
+Fixed Camera Streamer - Working MJPEG streaming
 """
 
 import subprocess
@@ -9,9 +9,8 @@ import threading
 from flask import Flask, Response
 import signal
 import sys
-import os
 
-print("📷 WORKING CAMERA STREAMER")
+print("📷 FIXED CAMERA STREAMER")
 print("="*60)
 
 app = Flask(__name__)
@@ -19,35 +18,94 @@ app = Flask(__name__)
 # Global variables
 camera_process = None
 camera_running = False
+frame_buffer = []
+buffer_lock = threading.Lock()
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
+def find_jpeg_boundaries(data):
+    """Find JPEG frame boundaries in stream"""
+    frames = []
+    start = 0
+    
+    while True:
+        # Find JPEG start marker (FFD8)
+        jpeg_start = data.find(b'\xff\xd8', start)
+        if jpeg_start == -1:
+            break
+        
+        # Find JPEG end marker (FFD9)
+        jpeg_end = data.find(b'\xff\xd9', jpeg_start + 2)
+        if jpeg_end == -1:
+            break
+        
+        # Extract complete JPEG frame
+        frame = data[jpeg_start:jpeg_end + 2]
+        frames.append(frame)
+        start = jpeg_end + 2
+    
+    return frames
+
+def read_camera_stream():
+    """Read camera stream and buffer frames"""
+    global camera_process, frame_buffer
+    
+    log("📡 Starting frame reader thread...")
+    buffer = b''
+    
+    while camera_running and camera_process:
+        try:
+            # Read chunk from ffmpeg
+            chunk = camera_process.stdout.read(4096)
+            
+            if not chunk:
+                log("⚠️ No more data from camera")
+                break
+            
+            buffer += chunk
+            
+            # Extract complete JPEG frames
+            frames = find_jpeg_boundaries(buffer)
+            
+            if frames:
+                with buffer_lock:
+                    # Keep only last 10 frames
+                    frame_buffer.extend(frames)
+                    frame_buffer = frame_buffer[-10:]
+                
+                # Remove processed frames from buffer
+                last_frame = frames[-1]
+                last_pos = buffer.rfind(last_frame) + len(last_frame)
+                buffer = buffer[last_pos:]
+                
+        except Exception as e:
+            log(f"❌ Reader error: {e}")
+            break
+    
+    log("📡 Frame reader stopped")
+
 def start_camera():
-    global camera_process, camera_running
+    global camera_process, camera_running, frame_buffer
     
     if camera_running and camera_process and camera_process.poll() is None:
         return True
     
-    # Stop existing process
     if camera_process:
         stop_camera()
     
     log("🚀 Starting camera...")
     
-    # Simpler command - let ffmpeg handle more
     cmd = [
         'ffmpeg',
         '-f', 'v4l2',
         '-input_format', 'mjpeg',
         '-video_size', '640x480',
-        '-framerate', '10',  # Lower for stability
+        '-framerate', '15',
         '-i', '/dev/video0',
         '-f', 'mjpeg',
-        '-q:v', '8',
-        '-vsync', 'vfr',  # Variable framerate
-        '-fflags', 'nobuffer',  # Reduce buffering
-        '-flush_packets', '1',  # Flush packets immediately
+        '-q:v', '5',  # Better quality
+        '-huffman', 'optimal',
         '-'
     ]
     
@@ -58,31 +116,30 @@ def start_camera():
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=10**6,
-            close_fds=True
+            bufsize=0  # No buffering
         )
         
         # Start stderr reader
         def read_stderr():
-            while True:
-                line = camera_process.stderr.readline()
-                if line:
-                    line_str = line.decode().strip()
-                    # Only show important messages
-                    if not line_str.startswith('frame='):
-                        log(f"FFMPEG: {line_str}")
-                elif camera_process.poll() is not None:
-                    break
-                time.sleep(0.1)
+            for line in camera_process.stderr:
+                line_str = line.decode().strip()
+                if not line_str.startswith('frame='):
+                    log(f"FFMPEG: {line_str}")
         
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
         stderr_thread.start()
         
-        # Give it time to start
-        time.sleep(3)
+        # Wait for startup
+        time.sleep(2)
         
         if camera_process.poll() is None:
             camera_running = True
+            frame_buffer = []
+            
+            # Start frame reader thread
+            reader_thread = threading.Thread(target=read_camera_stream, daemon=True)
+            reader_thread.start()
+            
             log("✅ Camera started successfully")
             return True
         else:
@@ -97,19 +154,17 @@ def stop_camera():
     global camera_process, camera_running
     if camera_process:
         log("📴 Stopping camera...")
+        camera_running = False
         try:
             camera_process.terminate()
             camera_process.wait(timeout=2)
         except:
             try:
                 camera_process.kill()
-                camera_process.wait()
             except:
                 pass
         camera_process = None
-    camera_running = False
 
-# HTML
 HTML = '''<!DOCTYPE html>
 <html>
 <head>
@@ -143,12 +198,25 @@ HTML = '''<!DOCTYPE html>
             border-radius: 10px;
             overflow: hidden;
             border: 2px solid #333;
+            position: relative;
         }
         
         #video-feed {
             width: 100%;
             height: auto;
             display: block;
+        }
+        
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ffaa00;
+            font-size: 18px;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            border-radius: 10px;
         }
         
         .status {
@@ -179,10 +247,18 @@ HTML = '''<!DOCTYPE html>
             background: #45a049;
         }
         
-        #loading {
-            color: #ffaa00;
-            font-size: 18px;
-            margin: 20px;
+        .live-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            background: #4CAF50;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
         }
     </style>
 </head>
@@ -190,18 +266,19 @@ HTML = '''<!DOCTYPE html>
     <h1>📷 Raspberry Pi Camera Stream</h1>
     <p class="subtitle">Live stream from /dev/video0</p>
     
-    <div id="loading">Loading camera feed...</div>
-    
-    <div class="video-container" style="display:none;" id="video-container">
-        <img id="video-feed" src="/stream.mjpg" alt="Live Camera Feed">
+    <div class="video-container">
+        <div id="loading">Loading camera feed...</div>
+        <img id="video-feed" style="display:none;" alt="Live Camera Feed">
     </div>
     
-    <div class="status" style="display:none;" id="status-div">
-        Status: <span id="status">Loading...</span> | 
+    <div class="status">
+        <span class="live-indicator"></span>
+        Status: <span id="status">Connecting...</span> | 
+        FPS: <span id="fps">--</span> | 
         Time: <span id="timestamp">--:--:--</span>
     </div>
     
-    <div class="controls" style="display:none;" id="controls">
+    <div class="controls">
         <button onclick="reloadStream()">🔄 Reload Stream</button>
         <button onclick="location.reload()">↻ Refresh Page</button>
     </div>
@@ -209,12 +286,12 @@ HTML = '''<!DOCTYPE html>
     <script>
         const video = document.getElementById('video-feed');
         const loading = document.getElementById('loading');
-        const videoContainer = document.getElementById('video-container');
-        const statusDiv = document.getElementById('status-div');
         const statusSpan = document.getElementById('status');
+        const fpsSpan = document.getElementById('fps');
         const timestamp = document.getElementById('timestamp');
-        const controls = document.getElementById('controls');
         
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
         let streamLoaded = false;
         
         function updateTime() {
@@ -227,59 +304,70 @@ HTML = '''<!DOCTYPE html>
             statusSpan.style.color = color || 'white';
         }
         
-        function showVideo() {
-            loading.style.display = 'none';
-            videoContainer.style.display = 'block';
-            statusDiv.style.display = 'block';
-            controls.style.display = 'block';
-            updateStatus('Live', '#4CAF50');
+        function updateFps() {
+            const now = Date.now();
+            const elapsed = (now - lastFpsUpdate) / 1000;
+            if (elapsed >= 1) {
+                const currentFps = (frameCount / elapsed).toFixed(1);
+                fpsSpan.textContent = currentFps;
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
         }
         
         video.onload = function() {
             if (!streamLoaded) {
+                console.log('First frame loaded');
                 streamLoaded = true;
-                showVideo();
-                console.log('Video stream loaded successfully');
+                loading.style.display = 'none';
+                video.style.display = 'block';
+                updateStatus('Live', '#4CAF50');
             }
+            frameCount++;
+            updateFps();
         };
         
-        video.onerror = function() {
-            updateStatus('Error', '#ff4444');
-            loading.textContent = 'Failed to load stream. Retrying...';
-            loading.style.color = '#ff4444';
+        video.onerror = function(e) {
+            console.error('Video error:', e);
+            updateStatus('Error - Reconnecting...', '#ff4444');
+            loading.style.display = 'block';
+            loading.textContent = 'Connection lost. Reconnecting...';
             
             setTimeout(() => {
-                video.src = '/stream.mjpg?t=' + Date.now();
+                reloadStream();
             }, 2000);
         };
         
         function reloadStream() {
+            console.log('Reloading stream...');
             updateStatus('Reloading...', '#ffaa00');
+            streamLoaded = false;
             video.src = '/stream.mjpg?t=' + Date.now();
         }
         
-        // Auto-update time
+        // Update time every second
         setInterval(updateTime, 1000);
         updateTime();
         
-        // Start the stream
-        video.src = '/stream.mjpg?t=' + Date.now();
+        // Start stream
+        console.log('Starting stream...');
+        video.src = '/stream.mjpg';
         
-        // If no stream after 10 seconds, try again
+        // Retry if not loaded after 10 seconds
         setTimeout(() => {
             if (!streamLoaded) {
-                console.log('No stream after 10 seconds, retrying...');
-                video.src = '/stream.mjpg?t=' + Date.now();
+                console.log('Stream timeout, retrying...');
+                reloadStream();
             }
         }, 10000);
         
-        // Auto-reload every 30 seconds
+        // Keep-alive: reload every 60 seconds
         setInterval(() => {
             if (streamLoaded) {
-                console.log('Auto-refreshing stream...');
-                video.src = '/stream.mjpg?t=' + Date.now();
+                console.log('Keep-alive: refreshing stream');
+                reloadStream();
             }
-        }, 30000);
+        }, 60000);
     </script>
 </body>
 </html>'''
@@ -291,42 +379,43 @@ def index():
 @app.route('/stream.mjpg')
 def stream():
     def generate():
-        try:
-            log("🎥 New client connected")
-            
-            # Ensure camera is running
-            if not camera_running:
-                log("⚠️ Starting camera for new client")
-                if not start_camera():
-                    log("❌ Failed to start camera")
-                    return
-            
-            if not camera_process or camera_process.poll() is not None:
-                log("❌ Camera process not running")
+        log("🎥 Client connected to stream")
+        
+        # Ensure camera is running
+        if not camera_running:
+            log("Starting camera for client")
+            if not start_camera():
+                log("Failed to start camera")
                 return
-            
-            log("📡 Streaming MJPEG data...")
-            
-            # Read from ffmpeg and stream to client
+            time.sleep(2)  # Wait for frames
+        
+        last_frame_idx = 0
+        
+        try:
             while True:
-                if camera_process and camera_process.stdout:
-                    # Read a chunk of data
-                    chunk = camera_process.stdout.read(1024 * 16)  # 16KB chunks
-                    if chunk:
-                        yield chunk
+                with buffer_lock:
+                    if len(frame_buffer) > last_frame_idx:
+                        # Get new frame
+                        frame = frame_buffer[-1]
+                        last_frame_idx = len(frame_buffer)
                     else:
-                        log("⚠️ No data from camera, stream ended")
-                        break
+                        frame = None
+                
+                if frame:
+                    # Send frame with proper MJPEG multipart format
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n'
+                           b'Content-Length: ' + str(len(frame)).encode() + b'\r\n'
+                           b'\r\n' + frame + b'\r\n')
                 else:
-                    log("❌ Camera stdout not available")
-                    break
+                    # No new frame, wait a bit
+                    time.sleep(0.01)
                     
+        except GeneratorExit:
+            log("🎥 Client disconnected")
         except Exception as e:
             log(f"❌ Stream error: {e}")
-        finally:
-            log("🎥 Client disconnected")
     
-    # Important: Use the correct content type for MJPEG stream
     return Response(
         generate(),
         mimetype='multipart/x-mixed-replace; boundary=frame',
@@ -334,41 +423,32 @@ def stream():
             'Cache-Control': 'no-cache, no-store, must-revalidate',
             'Pragma': 'no-cache',
             'Expires': '0',
-            'X-Accel-Buffering': 'no'  # Disable buffering for nginx (if used)
+            'Connection': 'close'
         }
     )
 
 @app.route('/status')
 def status():
+    with buffer_lock:
+        buffer_size = len(frame_buffer)
+    
     return {
         'camera_running': camera_running,
-        'camera_process_alive': camera_process.poll() is None if camera_process else False
+        'camera_alive': camera_process.poll() is None if camera_process else False,
+        'frames_buffered': buffer_size
     }
 
 def signal_handler(sig, frame):
-    log("\n🛑 Stopping camera streamer...")
+    log("\n🛑 Stopping...")
     stop_camera()
-    log("✅ Cleanup complete")
     sys.exit(0)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     
     print("\n" + "="*70)
-    print("🚀 STARTING WORKING CAMERA STREAMER")
+    print("🚀 STARTING FIXED CAMERA STREAMER")
     print("="*70)
-    
-    # Test with a simple command first
-    log("Testing camera with simple capture...")
-    test_cmd = ['ffmpeg', '-f', 'v4l2', '-i', '/dev/video0', '-frames:v', '1', '-f', 'image2', '-']
-    try:
-        result = subprocess.run(test_cmd, capture_output=True, timeout=5)
-        if result.returncode == 0:
-            log("✅ Camera test successful")
-        else:
-            log(f"❌ Camera test failed: {result.stderr.decode()[:100]}")
-    except Exception as e:
-        log(f"❌ Camera test error: {e}")
     
     # Get IP
     import socket
@@ -382,11 +462,11 @@ if __name__ == "__main__":
     print(f"\n🌐 Open in browser:")
     print(f"   http://localhost:5000")
     print(f"   http://{local_ip}:5000")
-    print(f"\n📊 Check status: http://localhost:5000/status")
     print("\n🛑 Press Ctrl+C to stop")
     print("="*70 + "\n")
     
     # Start camera
     start_camera()
     
+    # Run Flask
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
