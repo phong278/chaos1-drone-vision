@@ -1,0 +1,16 @@
+# Core dependencies for Pi Detection System
+# Tested on Raspberry Pi 4 & 5
+
+# OpenCV for computer vision and YOLO
+opencv-python==4.8.1.78
+# Note: If opencv-python fails, try opencv-python-headless
+
+# NumPy for numerical operations
+numpy>=1.21.0,<2.0.0
+
+# Flask for web streaming interface
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# Additional utilities
+Pillow>=10.0.0
