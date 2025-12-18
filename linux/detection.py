@@ -1,20 +1,21 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 import cv2
 import sys
 import signal
 import time
 import os
+import gc
 from datetime import datetime
 from pathlib import Path
 from collections import deque
+import threading
 from threading import Thread, Lock, Event
 from queue import Queue, Empty
 import numpy as np
 import urllib.request
-from ultralytics import YOLO  # Changed to Ultralytics YOLOv8
+from ultralytics import YOLO
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from streaming_server import VideoStreamer
 from config_loader import ConfigLoader
 
 # ==================== LOAD CONFIGURATION ====================
@@ -28,6 +29,50 @@ elif CONFIG["camera"]["backend"] == "CAP_ANY":
 else:
     CONFIG["camera"]["backend"] = cv2.CAP_ANY
 
+# Import streaming server only if enabled
+if CONFIG["system"].get("enable_streaming", False):
+    try:
+        from streaming_server import VideoStreamer
+        STREAMING_AVAILABLE = True
+    except ImportError:
+        print("⚠️ Streaming server not available")
+        STREAMING_AVAILABLE = False
+else:
+    STREAMING_AVAILABLE = False
+
+# ==================== MEMORY MONITOR ====================
+class MemoryMonitor:
+    """Monitor system memory to prevent crashes"""
+    def __init__(self, warning_threshold_mb=100):
+        self.warning_threshold = warning_threshold_mb * 1024 * 1024
+        self.last_check = time.time()
+        
+    def get_free_memory(self):
+        """Get free memory in bytes"""
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    if 'MemAvailable:' in line:
+                        return int(line.split()[1]) * 1024
+        except:
+            return None
+        return None
+    
+    def should_cleanup(self):
+        """Check if we need to run garbage collection"""
+        current_time = time.time()
+        if current_time - self.last_check < 5.0:  # Check every 5 seconds
+            return False
+        
+        self.last_check = current_time
+        free_mem = self.get_free_memory()
+        
+        if free_mem and free_mem < self.warning_threshold:
+            print(f"⚠️ Low memory: {free_mem/1024/1024:.1f}MB free")
+            return True
+        return False
+
 # ==================== STORAGE MANAGER ====================
 class StorageManager:
     """Manages image storage with automatic cleanup"""
@@ -38,199 +83,56 @@ class StorageManager:
         self.lock = Lock()
         print(f"📁 Storage folder: {self.folder_path.absolute()}")
         print(f"💾 Max storage: {max_size_mb} MB")
-        
-        try:
-            stat = os.statvfs(self.folder_path)
-            free_space = stat.f_bavail * stat.f_frsize
-            free_mb = free_space / (1024 * 1024)
-            print(f"💿 Free space: {free_mb:.0f} MB")
-        except:
-            pass
-
-    def get_folder_size(self):
-        total = 0
-        for file in self.folder_path.glob("detection_*.jpg"):
-            try:
-                total += file.stat().st_size
-            except:
-                pass
-        return total
-
-    def cleanup_old_files(self):
-        with self.lock:
-            current_size = self.get_folder_size()
-            if current_size <= self.max_size_bytes:
-                return
-            
-            print(f"⚠️ Storage limit reached ({current_size/1024/1024:.1f}MB)")
-            print("🧹 Cleaning up old files...")
-            
-            files = sorted(self.folder_path.glob("detection_*.jpg"),
-                           key=lambda x: x.stat().st_mtime)
-            deleted_count = 0
-            deleted_size = 0
-            
-            for file in files:
-                if current_size <= self.max_size_bytes * 0.8:
-                    break
-                try:
-                    file_size = file.stat().st_size
-                    file.unlink()
-                    current_size -= file_size
-                    deleted_count += 1
-                    deleted_size += file_size
-                except Exception as e:
-                    print(f"❌ Error deleting {file}: {e}")
-            
-            if deleted_count > 0:
-                print(f"✅ Deleted {deleted_count} files ({deleted_size/1024/1024:.1f}MB)")
 
     def save_image(self, image, prefix="detection", detections=None):
-        self.cleanup_old_files()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        if detections and len(detections) > 0:
-            labels = [d['label'][:3] for d in detections.values()]
-            label_str = "_".join(sorted(set(labels))[:2])
-            filename = self.folder_path / f"{prefix}_{label_str}_{timestamp}.jpg"
-        else:
-            filename = self.folder_path / f"{prefix}_{timestamp}.jpg"
+        filename = self.folder_path / f"{prefix}_{timestamp}.jpg"
         
         with self.lock:
             cv2.imwrite(str(filename), image,
                        [cv2.IMWRITE_JPEG_QUALITY, CONFIG["output"]["image_quality"]])
-        
         return filename
 
 # ==================== THERMAL MANAGER ====================
 class ThermalManager:
-    """Monitor and manage Pi temperature with dynamic throttling"""
-    def __init__(self, threshold=75):
+    """Monitor and manage Pi temperature"""
+    def __init__(self, threshold=70):
         self.threshold = threshold
-        self.throttled = False
-        self.temp_history = deque(maxlen=10)
-        print(f"🌡️ Thermal threshold: {threshold}°C")
-
+        self.critical_threshold = threshold + 5
+        self.last_warning = 0
+        
     def get_temperature(self):
         try:
             with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
-                temp = float(f.read()) / 1000.0
-                self.temp_history.append(temp)
-                return temp
+                return float(f.read()) / 1000.0
         except:
             return None
-
-    def get_average_temperature(self):
-        if len(self.temp_history) == 0:
-            return None
-        return sum(self.temp_history) / len(self.temp_history)
-
-    def should_throttle(self):
+    
+    def check_temperature(self):
         temp = self.get_temperature()
         if temp is None:
-            return False
+            return "normal"
         
-        avg_temp = self.get_average_temperature()
+        current_time = time.time()
         
-        # Dynamic throttling based on trend
-        if avg_temp and len(self.temp_history) > 5:
-            temp_trend = temp - list(self.temp_history)[0]
-            
-            if temp > self.threshold - 5 and temp_trend > 1.0:
-                # Rapidly heating
-                if not self.throttled:
-                    print(f"📈 Heating rapidly: {temp:.1f}°C (trend: +{temp_trend:.1f}°C)")
-                self.throttled = True
-                return True
-        
-        if temp > self.threshold:
-            if not self.throttled:
-                print(f"🔥 Thermal throttling: {temp:.1f}°C")
-            self.throttled = True
-            return True
-        elif temp < self.threshold - 8:
-            if self.throttled:
-                print(f"❄️ Throttling deactivated: {temp:.1f}°C")
-            self.throttled = False
-            return False
-        
-        return self.throttled
-
-# ==================== MODEL DOWNLOADER ====================
-class ModelDownloader:
-    """Download YOLOv8 Nano model if missing"""
-    @staticmethod
-    def download_file(url, dest):
-        try:
-            print(f"⬇️ Downloading {dest.split('/')[-1]}...")
-            urllib.request.urlretrieve(url, dest)
-            print("✅ Done.")
-            return True
-        except Exception as e:
-            print(f"❌ Download failed: {e}")
-            return False
-
-    @staticmethod
-    def ensure_yolov8_nano():
-        model_path = Path("yolov8n.pt")
-        if not model_path.exists():
-            print("📦 YOLOv8 Nano model not found, downloading...")
-            url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt"
-            return ModelDownloader.download_file(url, str(model_path))
-        return True
-
-# ==================== CAMERA GRABBER ====================
-class CameraGrabber(Thread):
-    """Threaded camera frame grabber with optimized buffer"""
-    def __init__(self, cap, queue, stop_event, buffer_size=2):
-        super().__init__(daemon=True)
-        self.cap = cap
-        self.queue = queue
-        self.stop_event = stop_event
-        self.buffer_size = buffer_size
-        self.last_frame = None
-        self.frame_lock = Lock()
-
-    def run(self):
-        # Clear camera buffer initially
-        for _ in range(5):
-            self.cap.read()
-        
-        while not self.stop_event.is_set():
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.005)  # Reduced sleep
-                continue
-            
-            with self.frame_lock:
-                self.last_frame = frame
-            
-            try:
-                if self.queue.qsize() < self.buffer_size:
-                    self.queue.put_nowait(frame)
-                else:
-                    # Drop oldest frame if queue is full
-                    try:
-                        self.queue.get_nowait()
-                        self.queue.put_nowait(frame)
-                    except:
-                        pass
-            except:
-                pass
-
-    def get_latest_frame(self):
-        with self.frame_lock:
-            return self.last_frame
+        if temp > self.critical_threshold:
+            if current_time - self.last_warning > 10:  # Limit warnings
+                print(f"🔥 CRITICAL: Temperature {temp:.1f}°C")
+                self.last_warning = current_time
+            return "critical"
+        elif temp > self.threshold:
+            if current_time - self.last_warning > 30:  # Limit warnings
+                print(f"⚠️ Warning: Temperature {temp:.1f}°C")
+                self.last_warning = current_time
+            return "warning"
+        return "normal"
 
 # ==================== DETECTION SYSTEM ====================
 class DetectionSystem:
     def __init__(self, config):
         self.config = config
-        self.model = None  # Changed to YOLOv8 model
+        self.model = None
         self.cap = None
-        self.frame_queue = None
-        self.grabber = None
-        self.stop_event = None
         
         # Initialize managers
         self.storage_manager = StorageManager(
@@ -242,355 +144,239 @@ class DetectionSystem:
             self.config["system"]["temp_threshold"]
         )
         
+        self.memory_monitor = MemoryMonitor()
+        
         # Performance tracking
         self.frame_count = 0
-        self.processed_count = 0
         self.start_time = time.time()
         self.fps = 0.0
-        self.processing_times = deque(maxlen=30)
-        self.last_print_time = time.time()
-        self.print_interval = 2.0
+        self.last_status_time = time.time()
         self.last_save_time = 0
+        self.last_gc_time = time.time()
         
-        # Frame cache for detection
-        self.last_detection_frame = None
-        self.last_detection_time = 0
-        self.detection_cache_valid = False
+        # Streaming
+        self.streamer = None
+        if STREAMING_AVAILABLE and config["system"].get("enable_streaming", False):
+            try:
+                streaming_port = config["system"].get("streaming_port", 5000)
+                max_clients = config["system"].get("max_streaming_clients", 3)
+                self.streamer = VideoStreamer(port=streaming_port, max_clients=max_clients)
+                print(f"🌐 Streaming enabled on port {streaming_port}")
+            except Exception as e:
+                print(f"⚠️ Failed to start streaming: {e}")
         
         self.setup_logging()
         self.init_system()
-
-        # Streaming setup
-        self.streaming_enabled = config["system"].get("enable_streaming", False)
-        self.streamer = None
-        
-        if self.streaming_enabled:
-            print("\n🌐 Initializing streaming server...")
-            streaming_port = config["system"].get("streaming_port", 5000)
-            max_clients = config["system"].get("max_streaming_clients", 5)
-            
-            self.streamer = VideoStreamer(port=streaming_port, max_clients=max_clients)
-            self.streamer.run()
-            time.sleep(0.5)
-            
-            import socket
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(('8.8.8.8', 1))
-                ip = s.getsockname()[0]
-                s.close()
-                print(f"✅ Stream URL: http://{ip}:{streaming_port}")
-                print(f"👥 Max viewers: {max_clients}")
-            except:
-                print(f"✅ Stream URL: http://YOUR_PI_IP:{streaming_port}")
 
     def setup_logging(self):
         if self.config["system"]["log_to_file"]:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_file = Path(self.config["system"]["data_folder"]) / f"log_{timestamp}.txt"
             self.log_file.parent.mkdir(exist_ok=True)
-            with open(self.log_file, 'w') as f:
-                f.write(f"Pi Detection Log - {timestamp}\n")
-                f.write("=" * 50 + "\n")
-
-    def log_message(self, message, level="INFO"):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        formatted_msg = f"[{timestamp}] [{level}] {message}"
-        if self.config["output"]["console_log"]:
-            print(formatted_msg)
-        if self.config["system"]["log_to_file"] and self.config["output"]["file_log"]:
-            with open(self.log_file, 'a') as f:
-                f.write(formatted_msg + "\n")
-
-    def print_detections_to_terminal(self, detections):
-        """Print detected objects with optimization"""
-        if not detections or not self.config["output"]["print_detections"]:
-            return
-        
-        current_time = time.time()
-        if current_time - self.last_print_time < self.print_interval:
-            return
-        
-        self.last_print_time = current_time
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        # Simplified output for performance
-        detection_summary = {}
-        for det in detections.values():
-            label = det['label']
-            detection_summary[label] = detection_summary.get(label, 0) + 1
-        
-        if detection_summary:
-            summary_str = ", ".join([f"{count}x {label}" for label, count in detection_summary.items()])
-            print(f"[{timestamp}] 🎯 Detected: {summary_str}")
 
     def init_system(self):
-        print("\n🚀 Initializing Detection System for Pi 5...")
+        print("\n🚀 Initializing Detection System...")
         
-        # Ensure YOLOv8 Nano model exists
-        if not ModelDownloader.ensure_yolov8_nano():
-            print("❌ Failed to get YOLOv8 Nano model!")
-            sys.exit(1)
-
+        # Load YOLOv8 model
         try:
             print("🧠 Loading YOLOv8 Nano model...")
             self.model = YOLO('yolov8n.pt')
-            
-            # Configure model for inference
-            self.model.conf = self.config['detection']['confidence']  # confidence threshold
-            self.model.iou = self.config['performance']['nms_threshold']  # NMS IoU threshold
-            
-            print("✅ YOLOv8 Nano model loaded")
-            
+            self.model.conf = self.config['detection']['confidence']
+            self.model.iou = self.config['performance']['nms_threshold']
+            print("✅ Model loaded")
         except Exception as e:
             print(f"❌ Failed to load model: {e}")
-            import traceback
-            traceback.print_exc()
             sys.exit(1)
-
+        
+        # Initialize camera
         self.init_camera()
 
-        self.frame_queue = Queue(maxsize=self.config["performance"]["frame_buffer_size"])
-        self.stop_event = Event()
-        
-        if self.config["performance"]["use_threading"]:
-            self.grabber = CameraGrabber(self.cap, self.frame_queue, self.stop_event, 
-                                         buffer_size=self.config["performance"]["frame_buffer_size"])
-            self.grabber.start()
-            print("🎥 Threaded frame capture enabled")
-
     def init_camera(self):
-        print("📷 Initializing camera with optimized settings...")
+        print("📷 Initializing camera...")
         try:
-            backend = self.config['camera']['backend']
-            
-            # Use V4L2 with optimized settings for Pi 5
-            self.cap = cv2.VideoCapture(self.config['camera']['device_id'], backend)
+            self.cap = cv2.VideoCapture(self.config['camera']['device_id'], 
+                                       self.config['camera']['backend'])
             
             if not self.cap.isOpened():
-                print(f"⚠️ Backend {backend} failed, trying default...")
-                self.cap = cv2.VideoCapture(self.config['camera']['device_id'])
-                if not self.cap.isOpened():
-                    print("❌ Could not open camera!")
-                    sys.exit(1)
+                print("❌ Could not open camera!")
+                sys.exit(1)
             
             # Set camera properties
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config['camera']['width'])
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config['camera']['height'])
             self.cap.set(cv2.CAP_PROP_FPS, self.config['camera']['fps'])
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer for low latency
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
-            # Pi 5 specific optimizations
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            # Try YUYV first (less CPU), fallback to MJPG
+            fourcc_code = cv2.VideoWriter_fourcc(*self.config['camera'].get('fourcc', 'YUYV'))
+            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc_code)
             
-            self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            print(f"✅ Camera: {self.frame_width}x{self.frame_height} @ {self.config['camera']['fps']} FPS")
-            print(f"📊 Camera backend: {self.cap.getBackendName()}")
+            actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"✅ Camera: {actual_width}x{actual_height} @ {self.config['camera']['fps']} FPS")
             
         except Exception as e:
             print(f"❌ Camera error: {e}")
             sys.exit(1)
 
-    def detect_objects(self, frame):
-        """YOLOv8 detection with caching"""
-        current_time = time.time()
+    def detect_objects_simple(self, frame):
+        """Simplified detection to reduce memory usage"""
+        inference_size = self.config["performance"].get("inference_size", 256)
         
-        # Check if we can reuse cached detections
-        if (self.detection_cache_valid and 
-            self.last_detection_frame is not None and
-            current_time - self.last_detection_time < 0.5):  # Cache valid for 500ms
-            return self.last_detection_frame
-        
-        # Perform detection
-        start_time = time.time()
-        
-        # Resize frame for faster inference if configured
-        inference_size = self.config["performance"].get("inference_size", 320)
-        if inference_size != self.frame_width:
-            inference_frame = cv2.resize(frame, (inference_size, int(inference_size * self.frame_height / self.frame_width)))
+        # Resize for inference
+        if frame.shape[1] != inference_size:
+            inference_frame = cv2.resize(frame, (inference_size, inference_size))
         else:
             inference_frame = frame
         
-        # Run YOLOv8 inference
-        results = self.model(inference_frame, verbose=False, imgsz=inference_size)
+        # Run inference with minimal settings
+        results = self.model(inference_frame, 
+                            verbose=False, 
+                            imgsz=inference_size,
+                            max_det=self.config['detection'].get('max_detections', 10))
         
         boxes = []
         classes = []
         scores = []
         
-        for result in results:
-            if result.boxes is not None:
-                for box in result.boxes:
-                    # Get box coordinates (relative)
-                    xyxy = box.xyxy[0].cpu().numpy()
-                    x1, y1, x2, y2 = xyxy
-                    
-                    # Normalize coordinates
-                    h, w = frame.shape[:2]
-                    x1_norm = x1 / w
-                    y1_norm = y1 / h
-                    x2_norm = x2 / w
-                    y2_norm = y2 / h
-                    
-                    boxes.append([y1_norm, x1_norm, y2_norm, x2_norm])
-                    classes.append(int(box.cls[0]))
-                    scores.append(float(box.conf[0]))
+        if results and results[0].boxes is not None:
+            for box in results[0].boxes:
+                conf = float(box.conf[0])
+                if conf < self.config['detection']['confidence']:
+                    continue
+                
+                # Get coordinates
+                xyxy = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = xyxy
+                
+                # Scale to original frame
+                height, width = frame.shape[:2]
+                scale_x = width / inference_size
+                scale_y = height / inference_size
+                
+                x1 = int(x1 * scale_x)
+                y1 = int(y1 * scale_y)
+                x2 = int(x2 * scale_x)
+                y2 = int(y2 * scale_y)
+                
+                boxes.append([x1, y1, x2, y2])
+                classes.append(int(box.cls[0]))
+                scores.append(conf)
         
-        # Cache results
-        self.last_detection_time = current_time
-        self.last_detection_frame = (np.array(boxes, dtype=float), 
-                                     np.array(classes, dtype=int), 
-                                     np.array(scores, dtype=float))
-        self.detection_cache_valid = True
+        return boxes, classes, scores
+
+    def process_detections(self, boxes, classes, scores):
+        """Process detection results"""
+        detections = {}
+        coco_classes = [
+            'person','bicycle','car','motorcycle','airplane','bus','train','truck','boat',
+            'traffic light','fire hydrant','stop sign','parking meter','bench','bird','cat',
+            'dog','horse','sheep','cow','elephant','bear','zebra','giraffe','backpack',
+            'umbrella','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball',
+            'kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket',
+            'bottle','wine glass','cup','fork','knife','spoon','bowl','banana','apple',
+            'sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake','chair',
+            'couch','potted plant','bed','dining table','toilet','tv','laptop','mouse',
+            'remote','keyboard','cell phone','microwave','oven','toaster','sink','refrigerator',
+            'book','clock','vase','scissors','teddy bear','hair drier','toothbrush'
+        ]
         
-        return self.last_detection_frame
-
-    def process_detections(self, frame, boxes, classes, scores):
-        """Process detection results with COCO class names"""
-        current_detections = {}
-        height, width = frame.shape[:2]
-
         for i in range(len(scores)):
-            if scores[i] < self.config['detection']['confidence']:
-                continue
-
-            class_id = int(classes[i])
-            
-            # Use COCO class names
-            coco_classes = [
-                'person','bicycle','car','motorcycle','airplane','bus','train','truck','boat',
-                'traffic light','fire hydrant','stop sign','parking meter','bench','bird','cat',
-                'dog','horse','sheep','cow','elephant','bear','zebra','giraffe','backpack',
-                'umbrella','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball',
-                'kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket',
-                'bottle','wine glass','cup','fork','knife','spoon','bowl','banana','apple',
-                'sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake','chair',
-                'couch','potted plant','bed','dining table','toilet','tv','laptop','mouse',
-                'remote','keyboard','cell phone','microwave','oven','toaster','sink','refrigerator',
-                'book','clock','vase','scissors','teddy bear','hair drier','toothbrush'
-            ]
-            
+            class_id = classes[i]
             label = coco_classes[class_id] if class_id < len(coco_classes) else f"class_{class_id}"
-
-            ymin, xmin, ymax, xmax = boxes[i]
-            x1 = int(max(0, xmin) * width)
-            y1 = int(max(0, ymin) * height)
-            x2 = int(min(1, xmax) * width)
-            y2 = int(min(1, ymax) * height)
-
-            detection_data = {
+            
+            detections[f"{label}_{i}"] = {
                 'label': label,
-                'confidence': float(scores[i]),
-                'bbox': (x1, y1, x2, y2),
+                'confidence': scores[i],
+                'bbox': tuple(boxes[i]),
             }
+        
+        return detections
 
-            current_detections[f"{label}_{len(current_detections)}"] = detection_data
-
-        return current_detections
-
-    def save_detection_image(self, frame, detections):
-        if not self.config['output']['save_detections']:
+    def display_status(self, fps, temp, detections):
+        """Display status with minimal overhead"""
+        current_time = time.time()
+        if current_time - self.last_status_time < self.config["output"].get("status_update_interval", 5):
             return
         
-        current_time = time.time()
-        should_save = current_time - self.last_save_time >= self.config['output']['save_interval']
+        self.last_status_time = current_time
         
-        if self.config['output']['save_on_detection'] and len(detections) == 0:
-            should_save = False
+        status = f"📊 {fps:4.1f}FPS | 🌡️{temp:4.1f}°C"
+        
+        if detections:
+            det_counts = {}
+            for det in detections.values():
+                label = det['label']
+                det_counts[label] = det_counts.get(label, 0) + 1
             
-        if should_save:
-            try:
-                filename = self.storage_manager.save_image(frame, detections=detections)
-                self.log_message(f"Saved: {filename.name}")
-                self.last_save_time = current_time
-            except Exception as e:
-                self.log_message(f"Error saving: {e}", "ERROR")
+            if det_counts:
+                main_label = next(iter(det_counts))
+                count = det_counts[main_label]
+                status += f" | 🎯 {count}x{main_label[:3]}"
+                if len(det_counts) > 1:
+                    status += f"(+{len(det_counts)-1})"
+        
+        print(status)
 
     def run(self):
-        print("\n" + "="*70)
-        print("🚀 PI 5 DETECTION SYSTEM STARTING (YOLOv8 Nano)")
-        print("="*70)
+        print("\n" + "="*60)
+        print("🚀 PI 5 DETECTION SYSTEM (Optimized for Stability)")
+        print("="*60)
         print("• Press Ctrl+C to stop")
         print(f"• Detection threshold: {self.config['detection']['confidence']}")
         print(f"• Target FPS: {self.config['performance']['throttle_fps']}")
-        print(f"• Inference size: {self.config['performance'].get('inference_size', 320)}px")
-
-        if self.streaming_enabled:
-            print(f"• Streaming: ENABLED on port {self.config['system']['streaming_port']}")
         
-        print("="*70 + "\n")
-
-        fps_start_time = time.time()
+        if self.streamer:
+            print(f"• Streaming: ENABLED")
+        print("="*60 + "\n")
+        
         fps_frame_count = 0
+        fps_start_time = time.time()
         frame_skip_counter = 0
-        last_stream_update = 0
-        stream_update_interval = 0.033
-        dynamic_frame_skip = 0
-
+        
         try:
             while True:
                 loop_start = time.time()
-
-                # Thermal check with dynamic throttling
-                if self.thermal_manager.should_throttle():
-                    thermal_temp = self.thermal_manager.get_temperature()
-                    avg_temp = self.thermal_manager.get_average_temperature()
-                    
-                    if avg_temp and avg_temp > self.config["system"]["temp_threshold"] - 2:
-                        dynamic_frame_skip = min(dynamic_frame_skip + 1, 5)
-                        if self.streaming_enabled and self.streamer:
-                            stream_update_interval = 0.2  # Slow updates when hot
-                        time.sleep(0.5)
-                    else:
-                        dynamic_frame_skip = max(dynamic_frame_skip - 1, 0)
+                
+                # Check temperature
+                temp_status = self.thermal_manager.check_temperature()
+                if temp_status == "critical":
+                    print("🔥 Critical temperature! Cooling down...")
+                    time.sleep(2.0)
                     continue
-                else:
-                    dynamic_frame_skip = max(dynamic_frame_skip - 1, 0)
-                    stream_update_interval = 0.033
-
-                # Get frame
-                frame = None
-                if self.config["performance"]["use_threading"]:
-                    try:
-                        frame = self.frame_queue.get(timeout=0.5)
-                    except Empty:
-                        # Try to get latest frame from grabber
-                        if self.grabber:
-                            frame = self.grabber.get_latest_frame()
-                        if frame is None:
-                            continue
-                else:
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        self.log_message("Frame read error", "ERROR")
-                        break
-
+                elif temp_status == "warning":
+                    # Skip frames when hot
+                    if frame_skip_counter < 2:
+                        frame_skip_counter += 1
+                        time.sleep(0.5)
+                        continue
+                
+                # Check memory
+                if self.memory_monitor.should_cleanup():
+                    gc.collect()
+                    self.last_gc_time = time.time()
+                
+                # Capture frame
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("❌ Failed to read frame")
+                    time.sleep(0.1)
+                    continue
+                
                 self.frame_count += 1
-
-                # Dynamic frame skipping based on load
-                total_frame_skip = self.config['performance']['frame_skip'] + dynamic_frame_skip
+                
+                # Apply frame skipping
                 if frame_skip_counter > 0:
                     frame_skip_counter -= 1
                     continue
-                frame_skip_counter = total_frame_skip
-
-                # Detection with timing
-                process_start = time.time()
-                boxes, classes, scores = self.detect_objects(frame)
-                detections = self.process_detections(frame, boxes, classes, scores)
-                self.processed_count += 1
-                process_time = time.time() - process_start
-                self.processing_times.append(process_time)
-
-                self.print_detections_to_terminal(detections)
-
-                # Update stream with optimized intervals
-                current_time = time.time()
-                if self.streaming_enabled and self.streamer and \
-                   (current_time - last_stream_update >= stream_update_interval):
-                    
+                frame_skip_counter = self.config['performance']['frame_skip']
+                
+                # Run detection
+                boxes, classes, scores = self.detect_objects_simple(frame)
+                detections = self.process_detections(boxes, classes, scores)
+                
+                # Update streaming
+                if self.streamer:
                     temp = self.thermal_manager.get_temperature()
                     self.streamer.update_frame(
                         frame=frame,
@@ -598,52 +384,37 @@ class DetectionSystem:
                         fps=self.fps,
                         frame_count=self.frame_count,
                         temperature=temp,
-                        processing_time=process_time * 1000
+                        processing_time=0
                     )
-                    last_stream_update = current_time
                 
-                self.save_detection_image(frame, detections)
-
-                # FPS calculation
-                fps_frame_count += 1
-                if time.time() - fps_start_time >= 1.0:  # Update every second
-                    elapsed = time.time() - fps_start_time
-                    self.fps = fps_frame_count / elapsed if elapsed > 0 else 0.0
-                    fps_start_time = time.time()
-                    fps_frame_count = 0
+                # Save image if needed
+                current_time = time.time()
+                if (self.config['output']['save_detections'] and 
+                    current_time - self.last_save_time >= self.config['output']['save_interval'] and
+                    (not self.config['output']['save_on_detection'] or len(detections) > 0)):
                     
-                    # Display status every 3 seconds
-                    if int(time.time()) % 3 == 0:
-                        temp = self.thermal_manager.get_temperature()
-                        if temp:
-                            client_info = ""
-                            if self.streaming_enabled and self.streamer:
-                                client_info = f" | 👥 {self.streamer.active_clients}"
-                            
-                            status_msg = f"📊 {self.fps:5.1f}FPS | 🌡️{temp:4.1f}°C | F{self.frame_count}{client_info}"
-                            
-                            if detections:
-                                det_types = {}
-                                for det in detections.values():
-                                    label = det['label']
-                                    det_types[label] = det_types.get(label, 0) + 1
-                                
-                                if det_types:
-                                    main_det = next(iter(det_types))
-                                    count = det_types[main_det]
-                                    status_msg += f" | 🎯 {count}x{main_det[:3]}"
-                                    if len(det_types) > 1:
-                                        status_msg += f"(+{len(det_types)-1})"
-                            
-                            print(status_msg)
-
-                # Adaptive sleep for target FPS
+                    self.storage_manager.save_image(frame, detections=detections)
+                    self.last_save_time = current_time
+                
+                # Update FPS
+                fps_frame_count += 1
+                if time.time() - fps_start_time >= 2.0:
+                    self.fps = fps_frame_count / (time.time() - fps_start_time)
+                    fps_frame_count = 0
+                    fps_start_time = time.time()
+                    
+                    # Display status
+                    temp = self.thermal_manager.get_temperature()
+                    if temp:
+                        self.display_status(self.fps, temp, detections)
+                
+                # Throttle to target FPS
                 elapsed = time.time() - loop_start
                 target_time = 1.0 / self.config['performance']['throttle_fps']
-                sleep_time = target_time - elapsed - 0.001  # Small buffer
-                if sleep_time > 0.001:  # Only sleep if significant time left
-                    time.sleep(sleep_time)
-
+                sleep_time = target_time - elapsed
+                if sleep_time > 0.001:
+                    time.sleep(min(sleep_time, 0.1))  # Cap sleep time
+                
         except KeyboardInterrupt:
             print("\n\n⏹️ Stopping...")
         except Exception as e:
@@ -654,10 +425,7 @@ class DetectionSystem:
             self.cleanup()
 
     def cleanup(self):
-        print("\n" + "="*50)
-        print("🧹 Cleaning up...")
-        if self.stop_event:
-            self.stop_event.set()
+        print("\n🧹 Cleaning up...")
         if self.cap:
             self.cap.release()
         if self.streamer:
@@ -665,83 +433,48 @@ class DetectionSystem:
         
         runtime = time.time() - self.start_time
         print(f"⏱️ Runtime: {runtime:.1f}s")
-        print(f"🎬 Total frames: {self.frame_count}")
-        print(f"🔍 Processed frames: {self.processed_count}")
-        if self.processed_count > 0:
-            avg_fps = self.processed_count / runtime
-            print(f"📈 Avg processing FPS: {avg_fps:.1f}")
-            
-            if self.processing_times:
-                avg_process_time = sum(self.processing_times) / len(self.processing_times)
-                print(f"⚡ Avg inference: {avg_process_time*1000:.1f}ms")
-        print("="*50)
+        print(f"🎬 Frames processed: {self.frame_count}")
+        if self.frame_count > 0:
+            print(f"📈 Avg FPS: {self.frame_count/runtime:.1f}")
+        print("✅ Cleanup complete")
 
 # ==================== MAIN ====================
 def signal_handler(sig, frame):
-    print("\n\n⏹️ Ctrl+C detected - Shutting down gracefully...")
+    print("\n\n⏹️ Ctrl+C detected")
     sys.exit(0)
 
-def check_pi5_optimizations():
-    """Check and suggest Pi 5 optimizations"""
-    try:
-        with open('/proc/device-tree/model', 'r') as f:
-            model = f.read().lower()
-            
-        if 'raspberry pi 5' in model:
-            print("✅ Raspberry Pi 5 detected")
-            print("💡 Pi 5 Optimizations enabled:")
-            print("   • YOLOv8 Nano for better performance")
-            print("   • Dynamic thermal throttling")
-            print("   • Frame caching for efficiency")
-            return True
-        elif 'raspberry pi 4' in model:
-            print("⚠️ Raspberry Pi 4 detected - Some optimizations may be less effective")
-            return True
-        else:
-            print("⚠️ Unknown/Non-Pi hardware detected")
-            return False
-    except:
-        print("⚠️ Could not verify hardware")
-        return True
-
 def main():
-    """Main function with proper setup and teardown"""
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Check hardware and warn
-    if not check_pi5_optimizations():
-        response = input("Continue anyway? (y/n): ")
-        if response.lower() != 'y':
-            sys.exit(1)
+    print("🔧 Checking system...")
     
-    # Check for Ultralytics installation
+    # Check power supply
     try:
-        import ultralytics
-        print(f"✅ Ultralytics version: {ultralytics.__version__}")
-    except ImportError:
-        print("❌ Ultralytics package not found!")
-        print("   Install with: pip install ultralytics")
-        sys.exit(1)
+        with open('/sys/class/power_supply/rpi_poe_power/current_now', 'r') as f:
+            current = int(f.read()) / 1000  # mA
+            if current < 2500:
+                print(f"⚠️ Power supply may be weak: {current:.0f}mA")
+    except:
+        pass
+    
+    # Check temperature
+    try:
+        with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+            temp = float(f.read()) / 1000.0
+            print(f"🌡️ Current temperature: {temp:.1f}°C")
+            if temp > 70:
+                print("⚠️ Temperature already high!")
+    except:
+        print("⚠️ Could not read temperature")
     
     try:
-        print("\n" + "="*60)
-        print("Starting Pi 5 Object Detection System")
-        print("="*60)
-        
         system = DetectionSystem(CONFIG)
         system.run()
-        
-    except KeyboardInterrupt:
-        print("\n\n🛑 Program interrupted by user")
     except Exception as e:
-        print(f"\n\n💥 Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"💥 Fatal error: {e}")
         return 1
     
-    print("\n👋 Program finished successfully")
     return 0
 
 if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+    sys.exit(main())
