@@ -134,7 +134,7 @@ class DetectionSystem:
         
         target_classes = ['person', 'bird', 'bicycle', 'car', 'truck']  # adapt for drones, trees
         class_ids = [labels.index(c) for c in target_classes if c in labels]
-        results = self.model(frame, classes=class_ids, imgsz=inference_size, conf=self.config['detection']['confidence'])
+        results = self.model(frame, imgsz=inference_size, conf=self.config['detection']['confidence'], verbose=False)
 
 
         
