@@ -7,6 +7,12 @@ from queue import Queue
 import numpy as np
 from ultralytics import YOLO
 
+def get_cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.read()) / 1000.0
+    except:
+        return None
 # Simple MJPEG Streamer (no Flask)
 class SimpleStreamer:
     def __init__(self, port=5000):
@@ -110,12 +116,7 @@ class DetectionSystem:
             self.streamer = SimpleStreamer(port=config['system']['streaming_port'])
             threading.Thread(target=self.streamer.run, daemon=True).start()
             time.sleep(1)  # Let server start
-    def get_cpu_temp():
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp") as f:
-                return int(f.read()) / 1000.0
-        except:
-            return None
+   
     def detect(self, frame):
         """Run YOLOv8 detection on frame"""
         inference_size = self.config['performance']['inference_size']
@@ -240,7 +241,7 @@ class DetectionSystem:
                     time.sleep(target - elapsed)
 
                 if time.time() - last_sys_log >= 5.0:
-                    temp = self.get_cpu_temp()
+                    temp = get_cpu_temp()
                     if temp:
                         print(
                             f"🌡️ CPU: {temp:.1f}°C | "
