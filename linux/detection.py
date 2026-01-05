@@ -24,7 +24,7 @@ class SimpleStreamer:
         while self.running:
             with self.frame_lock:
                 if self.frame is not None:
-                    _, jpeg = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    _, jpeg = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     if _:
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + 
@@ -95,7 +95,11 @@ class DetectionSystem:
         self.model.conf = config['detection']['confidence']
         
         # Initialize camera
-        self.cap = cv2.VideoCapture(config['camera']['device_id'])
+        self.cap = cv2.VideoCapture(
+            config['camera']['device_id'],
+            cv2.CAP_V4L2
+        )
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config['camera']['width'])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config['camera']['height'])
         self.cap.set(cv2.CAP_PROP_FPS, config['camera']['fps'])
@@ -254,10 +258,10 @@ if __name__ == "__main__":
         },
         'camera': {
             'device_id': 0,
-            'width': 640,
-            'height': 480,
+            'width': 1280,
+            'height': 720,
             'fps': 15,
-            'backend': 'CAP_V4L2'
+            
         },
         'detection': {
             'model_cfg': 'yolov8n.pt',
