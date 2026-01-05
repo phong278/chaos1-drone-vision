@@ -122,14 +122,11 @@ class DetectionSystem:
         inference_size = self.config['performance']['inference_size']
         
         
-        
-        # Run detection
-        results = self.model(
-            frame,
-            imgsz=inference_size,
-            conf=self.config['detection']['confidence'],
-            verbose=False
-        )
+        target_classes = ['person', 'bird', 'bicycle', 'car', 'truck']  # adapt for drones, trees
+        class_ids = [labels.index(c) for c in target_classes if c in labels]
+        results = self.model(frame, classes=class_ids, imgsz=inference_size, conf=self.config['detection']['confidence'])
+
+
         
         detections = []
         if results and results[0].boxes is not None:
@@ -184,7 +181,7 @@ class DetectionSystem:
         print("Starting Object Detection")
         print(f"Camera: {self.config['camera']['width']}x{self.config['camera']['height']}")
         print(f"Confidence: {self.config['detection']['confidence']}")
-        last_sys_log = time.time()
+        # last_sys_log = time.time()
         frame_count = 0
         fps_time = time.time()
         fps = 0
@@ -234,16 +231,16 @@ class DetectionSystem:
                 if elapsed < target:
                     time.sleep(target - elapsed)
 
-                if time.time() - last_sys_log >= 5.0:
-                    temp = get_cpu_temp()
-                    if temp:
-                        print(
-                            f"🌡️ CPU: {temp:.1f}°C | "
-                            f"FPS: {fps} | "
-                            f"Resolution: {frame.shape[1]}x{frame.shape[0]} | "
-                            f"Detections: {len(detections)}"
-                        )
-                    last_sys_log = time.time()
+                # if time.time() - last_sys_log >= 5.0:
+                #     temp = get_cpu_temp()
+                #     if temp:
+                #         print(
+                #             f"🌡️ CPU: {temp:.1f}°C | "
+                #             f"FPS: {fps} | "
+                #             f"Resolution: {frame.shape[1]}x{frame.shape[0]} | "
+                #             f"Detections: {len(detections)}"
+                #         )
+                #     last_sys_log = time.time()
                 
         except KeyboardInterrupt:
             print("\n⏹️ Stopping...")
@@ -264,7 +261,7 @@ if __name__ == "__main__":
         'performance': {
             'throttle_fps': 15,
             'frame_skip': 2,
-            'inference_size': 416,
+            'inference_size': 320,
             'use_threading': False
         },
         'camera': {
