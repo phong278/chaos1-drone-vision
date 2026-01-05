@@ -30,7 +30,7 @@ class SimpleStreamer:
         while self.running:
             with self.frame_lock:
                 if self.frame is not None:
-                    _, jpeg = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    _, jpeg = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                     if _:
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + 
@@ -121,19 +121,14 @@ class DetectionSystem:
         """Run YOLOv8 detection on frame"""
         inference_size = self.config['performance']['inference_size']
         
-        # Resize for faster inference
-        if frame.shape[1] != inference_size:
-            inference_frame = cv2.resize(frame, (inference_size, inference_size))
-        else:
-            inference_frame = frame
+        
         
         # Run detection
         results = self.model(
-            inference_frame,
-            verbose=False,
+            frame,
             imgsz=inference_size,
             conf=self.config['detection']['confidence'],
-            classes=None   # explicitly allow all classes
+            verbose=False
         )
         
         detections = []
@@ -143,16 +138,7 @@ class DetectionSystem:
                 if conf < self.config['detection']['confidence']:
                     continue
                 
-                # Get box coordinates
-                xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = xyxy
-                
-                # Scale to original frame
-                h, w = frame.shape[:2]
-                x1 = int(x1 * w / inference_size)
-                y1 = int(y1 * h / inference_size)
-                x2 = int(x2 * w / inference_size)
-                y2 = int(y2 * h / inference_size)
+               
                 
                 # Get label
                 class_id = int(box.cls[0])
@@ -168,12 +154,12 @@ class DetectionSystem:
                             'book','clock','vase','scissors','teddy bear','hair drier','toothbrush'
                         ]
                 label = labels[class_id] if class_id < len(labels) else 'object'
-                
                 detections.append({
                     'label': label,
                     'confidence': conf,
-                    'bbox': (x1, y1, x2, y2)
+                    'bbox': box.xyxy[0].cpu().numpy().astype(int)
                 })
+                
         
         return detections
     
@@ -203,6 +189,7 @@ class DetectionSystem:
         fps_time = time.time()
         fps = 0
         
+        last_detections = []
         try:
             while True:
                 start_time = time.time()
@@ -216,11 +203,12 @@ class DetectionSystem:
                 frame_count += 1
                 
                 # Frame skipping
-                if frame_count % (self.config['performance']['frame_skip'] + 1) != 0:
-                    continue
+                if frame_count % (self.config['performance']['frame_skip'] + 1) == 0:
+                    last_detections = self.detect(frame)
+
+                detections = last_detections
                 
-                # Detect objects
-                detections = self.detect(frame)
+                
                 
                 # Draw detections
                 display_frame = self.draw_detections(frame.copy(), detections)
@@ -274,9 +262,9 @@ if __name__ == "__main__":
             'max_streaming_clients': 5
         },
         'performance': {
-            'throttle_fps': 10,
-            'frame_skip': 1,
-            'inference_size': 640,
+            'throttle_fps': 15,
+            'frame_skip': 2,
+            'inference_size': 416,
             'use_threading': False
         },
         'camera': {
@@ -288,7 +276,7 @@ if __name__ == "__main__":
         },
         'detection': {
             'model_cfg': 'yolov8n.pt',
-            'confidence': 0.25
+            'confidence': 0.4
         }
     }
     
