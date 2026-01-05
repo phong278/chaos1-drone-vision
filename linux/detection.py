@@ -110,7 +110,12 @@ class DetectionSystem:
             self.streamer = SimpleStreamer(port=config['system']['streaming_port'])
             threading.Thread(target=self.streamer.run, daemon=True).start()
             time.sleep(1)  # Let server start
-    
+    def get_cpu_temp():
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                return int(f.read()) / 1000.0
+        except:
+            return None
     def detect(self, frame):
         """Run YOLOv8 detection on frame"""
         inference_size = self.config['performance']['inference_size']
@@ -186,7 +191,7 @@ class DetectionSystem:
         print("🚀 Starting Object Detection")
         print(f"📷 Camera: {self.config['camera']['width']}x{self.config['camera']['height']}")
         print(f"🎯 Confidence: {self.config['detection']['confidence']}")
-        
+        last_sys_log = time.time()
         frame_count = 0
         fps_time = time.time()
         fps = 0
@@ -233,6 +238,17 @@ class DetectionSystem:
                 target = 1.0 / self.config['performance']['throttle_fps']
                 if elapsed < target:
                     time.sleep(target - elapsed)
+
+                if time.time() - last_sys_log >= 5.0:
+                    temp = self.get_cpu_temp()
+                    if temp:
+                        print(
+                            f"🌡️ CPU: {temp:.1f}°C | "
+                            f"FPS: {fps} | "
+                            f"Resolution: {frame.shape[1]}x{frame.shape[0]} | "
+                            f"Detections: {len(detections)}"
+                        )
+                    last_sys_log = time.time()
                 
         except KeyboardInterrupt:
             print("\n⏹️ Stopping...")
