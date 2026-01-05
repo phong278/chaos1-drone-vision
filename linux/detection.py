@@ -128,7 +128,13 @@ class DetectionSystem:
             inference_frame = frame
         
         # Run detection
-        results = self.model(inference_frame, verbose=False, imgsz=inference_size)
+        results = self.model(
+            inference_frame,
+            verbose=False,
+            imgsz=inference_size,
+            conf=self.config['detection']['confidence'],
+            classes=None   # explicitly allow all classes
+        )
         
         detections = []
         if results and results[0].boxes is not None:
@@ -189,9 +195,9 @@ class DetectionSystem:
         return frame
     
     def run(self):
-        print("🚀 Starting Object Detection")
-        print(f"📷 Camera: {self.config['camera']['width']}x{self.config['camera']['height']}")
-        print(f"🎯 Confidence: {self.config['detection']['confidence']}")
+        print("Starting Object Detection")
+        print(f"Camera: {self.config['camera']['width']}x{self.config['camera']['height']}")
+        print(f"Confidence: {self.config['detection']['confidence']}")
         last_sys_log = time.time()
         frame_count = 0
         fps_time = time.time()
@@ -270,7 +276,7 @@ if __name__ == "__main__":
         'performance': {
             'throttle_fps': 10,
             'frame_skip': 1,
-            'inference_size': 320,
+            'inference_size': 640,
             'use_threading': False
         },
         'camera': {
@@ -282,7 +288,7 @@ if __name__ == "__main__":
         },
         'detection': {
             'model_cfg': 'yolov8n.pt',
-            'confidence': 0.5
+            'confidence': 0.25
         }
     }
     
