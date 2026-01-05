@@ -57,7 +57,7 @@ class SimpleStreamer:
                         self.wfile.write(b'''
                         <html><head><title>Camera Stream</title></head>
                         <body style="margin:0;background:#000;">
-                            <img src="/stream.mjpg" style="width:100%;height:100%;object-fit:contain;">
+                            <img src="/stream.mjpg">
                         </body></html>
                         ''')
             
