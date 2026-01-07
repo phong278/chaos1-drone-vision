@@ -11,8 +11,9 @@ __pycache__/
 venv/
 *.env
 temp.txt
-# Config files
-config.json
-config_test.json
-config_local.json
 *.json
+vids/
+runs_yolo/
+*.pt
+dataset/
+runs/
