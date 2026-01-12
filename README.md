@@ -48,6 +48,9 @@ names:
   - Vehicle
 ```
 
+`https://www.kaggle.com/datasets/a2015003713/militaryaircraftdetectiondataset`
+`https://www.kaggle.com/datasets/siddharthkumarsah/ships-in-aerial-images`
+
 ### Supported Classes
 
 | ID | Class |

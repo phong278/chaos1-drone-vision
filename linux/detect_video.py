@@ -6,7 +6,7 @@ import os
 model = YOLO("onnx/best.onnx", task="detect")  # ONNX is safer on Windows
 
 # Input video path
-input_video_path = "../vids/5.mp4"
+input_video_path = "../vids/6.mp4"
 
 # Output directory
 output_dir = "../vids/detection/"
@@ -34,7 +34,7 @@ while cap.isOpened():
         break
 
     # Run object detection
-    results = model(frame, imgsz=640, conf=0.4, verbose=False)
+    results = model(frame, imgsz=768, conf=0.4, verbose=False)
 
     # Draw detections
     if results and results[0].boxes is not None:

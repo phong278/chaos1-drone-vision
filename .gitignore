@@ -17,3 +17,8 @@ runs_yolo/
 *.pt
 dataset/
 runs/
+test/
+train/
+val/
+*.txt
+*.zip
