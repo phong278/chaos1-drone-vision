@@ -31,33 +31,42 @@ def main():
     # -------------------------------
     start = time.time()
 
-    # Use advanced features for better generalization:
-    # - auto_augment for data augmentation
-    # - mixup/cutmix for robust training
-    # - early stopping based on validation loss
-    # - save the best model only
+ 
+    # - Strong augmentations including mosaic & mixup 
+    # - Label smoothing to reduce overconfidence
+    # - Freeze first layers for faster convergence
     model.train(
         data=DATA_YAML,
-        epochs=200,
-        imgsz=640,
-        batch=16,
+        epochs=MAX_EPOCHS,
+        imgsz=IMG_SIZE,
+        batch=BATCH,
         device=DEVICE,
         workers=8,
         cache="disk",
         project="runs_yolo",
-        name="yolov8n_mili_v1",
-        patience=30,
+        name="yolov8n_mili_v3",
+        patience=PATIENCE,
 
         optimizer="AdamW",
-        lr0=0.01,
-        lrf=0.01,
-        cos_lr=True,
+        lr0=0.005,      # slightly lower initial LR for stability
+        lrf=0.05,       # final LR factor
+        cos_lr=True,    # cosine scheduler
 
-        augment=True,
-        mixup=0.05,
-        close_mosaic=20,
+        augment=True,   # enable augmentation
+        mosaic=True,
+        mixup=0.05,      # slightly higher for robust training
+        hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
+        flipud=0.5, fliplr=0.5,
+        degrees=10,
+        translate=0.1,
+        scale=0.1,
+        shear=2,
+        perspective=0.0,
+
+        label_smoothing=0.05,  # reduce overconfidence
+
         cls=0.6,
-        freeze=10,
+        freeze=10,      # freeze first 10 layers
 
         val=True,
         plots=True,
@@ -104,7 +113,6 @@ def main():
     model.export(format="openvino", imgsz=IMG_SIZE)
 
     print("\nAll done!")
-
 
 if __name__ == "__main__":
     freeze_support()

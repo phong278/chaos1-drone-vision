@@ -6,7 +6,7 @@ import os
 model = YOLO("onnx/best.onnx", task="detect")  # ONNX is safer on Windows
 
 # Input video path
-input_video_path = "../vids/6.mp4"
+input_video_path = "../vids/1.mp4"
 
 # Output directory
 output_dir = "../vids/detection/"
