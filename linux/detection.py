@@ -94,7 +94,7 @@ class SimpleStreamer:
 class DetectionSystem:
     def __init__(self, config):
         self.config = config
-        self.model = YOLO('openvino_model/')
+        self.model = YOLO('models/openvino/')
         self.model.conf = config['detection']['confidence']
         # Initialize camera
         self.cap = cv2.VideoCapture(
