@@ -1,0 +1,30 @@
+description: Ultralytics best model trained on ../dataset/data.yml
+author: Ultralytics
+date: '2026-01-13T15:31:14.850819'
+version: 8.3.234
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: Artillery
+  1: Missile
+  2: Radar
+  3: M. Rocket Launcher
+  4: Soldier
+  5: Tank
+  6: Vehicle
+  7: Aircraft
+  8: Ships
+args:
+  batch: 1
+  fraction: 1.0
+  half: false
+  int8: false
+  dynamic: false
+  nms: false
+channels: 3

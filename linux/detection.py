@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 import cv2
-import sys
 import time
 import threading
-from queue import Queue
-import numpy as np
 from ultralytics import YOLO
 
 def get_cpu_temp():
@@ -13,7 +10,7 @@ def get_cpu_temp():
             return int(f.read()) / 1000.0
     except:
         return None
-# Simple MJPEG Streamer (no Flask)
+
 class SimpleStreamer:
     def __init__(self, port=5000):
         self.port = port
@@ -35,11 +32,11 @@ class SimpleStreamer:
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + 
                                jpeg.tobytes() + b'\r\n')
-            time.sleep(0.033)  # ~30 FPS
+            time.sleep(0.033)  
     
     def run(self):
         try:
-            import socket
+          
             from http.server import HTTPServer, BaseHTTPRequestHandler
             
             class StreamingHandler(BaseHTTPRequestHandler):
@@ -74,8 +71,8 @@ class SimpleStreamer:
             
             self.running = True
             server = StreamingServer(('0.0.0.0', self.port), StreamingHandler, streamer=self)
-            print(f"📹 Streaming at http://localhost:{self.port}")
-            print(f"📹 Network: http://{self._get_ip()}:{self.port}")
+            print(f"Streaming at http://localhost:{self.port}")
+            print(f"Network: http://{self._get_ip()}:{self.port}")
             server.serve_forever()
             
         except Exception as e:
@@ -89,7 +86,7 @@ class SimpleStreamer:
             return s.getsockname()[0]
         except:
             return "YOUR_PI_IP"
-    
+        
     def stop(self):
         self.running = False
 
@@ -97,9 +94,8 @@ class SimpleStreamer:
 class DetectionSystem:
     def __init__(self, config):
         self.config = config
-        self.model = YOLO('yolov8n.pt')
+        self.model = YOLO('models/openvino/')
         self.model.conf = config['detection']['confidence']
-        
         # Initialize camera
         self.cap = cv2.VideoCapture(
             config['camera']['device_id'],
@@ -110,54 +106,30 @@ class DetectionSystem:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config['camera']['height'])
         self.cap.set(cv2.CAP_PROP_FPS, config['camera']['fps'])
         
-        # Streaming
+        
         self.streamer = None
         if config['system']['enable_streaming']:
             self.streamer = SimpleStreamer(port=config['system']['streaming_port'])
             threading.Thread(target=self.streamer.run, daemon=True).start()
-            time.sleep(1)  # Let server start
+            time.sleep(1)  
    
     def detect(self, frame):
         """Run YOLOv8 detection on frame"""
         inference_size = self.config['performance']['inference_size']
-        labels = ['person','bicycle','car','motorcycle','airplane','bus','train','truck','boat',
-                            'traffic light','fire hydrant','stop sign','parking meter','bench','bird','cat',
-                            'dog','horse','sheep','cow','elephant','bear','zebra','giraffe','backpack',
-                            'umbrella','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball',
-                            'kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket',
-                            'bottle','wine glass','cup','fork','knife','spoon','bowl','banana','apple',
-                            'sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake','chair',
-                            'couch','potted plant','bed','dining table','toilet','tv','laptop','mouse',
-                            'remote','keyboard','cell phone','microwave','oven','toaster','sink','refrigerator',
-                            'book','clock','vase','scissors','teddy bear','hair drier','toothbrush'
-                        ]
-        
-        target_classes = ['person', 'bird', 'bicycle', 'car', 'truck']  # adapt for drones, trees
-        class_ids = [labels.index(c) for c in target_classes if c in labels]
         results = self.model(frame, imgsz=inference_size, conf=self.config['detection']['confidence'], verbose=False)
-
-
-        
         detections = []
         if results and results[0].boxes is not None:
             for box in results[0].boxes:
                 conf = float(box.conf[0])
                 if conf < self.config['detection']['confidence']:
                     continue
-                
-               
-                
-                # Get label
                 class_id = int(box.cls[0])
-                
-                label = labels[class_id] if class_id < len(labels) else 'object'
+                label = self.model.names[class_id] if class_id < len(self.model.names) else 'object'
                 detections.append({
                     'label': label,
                     'confidence': conf,
                     'bbox': box.xyxy[0].cpu().numpy().astype(int)
-                })
-                
-        
+                })           
         return detections
     
     def draw_detections(self, frame, detections):
@@ -167,21 +139,17 @@ class DetectionSystem:
             label = det['label']
             conf = det['confidence']
             
-            # Draw box
+            # Draw box and label
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Draw label
             label_text = f"{label}: {conf:.1%}"
             cv2.putText(frame, label_text, (x1, y1-10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
         return frame
     
     def run(self):
         print("Starting Object Detection")
         print(f"Camera: {self.config['camera']['width']}x{self.config['camera']['height']}")
         print(f"Confidence: {self.config['detection']['confidence']}")
-        # last_sys_log = time.time()
         frame_count = 0
         fps_time = time.time()
         fps = 0
@@ -190,68 +158,46 @@ class DetectionSystem:
         try:
             while True:
                 start_time = time.time()
-                
-                # Capture frame
                 ret, frame = self.cap.read()
                 if not ret:
                     print("❌ Camera error")
                     break
-                
                 frame_count += 1
-                
                 # Frame skipping
                 if frame_count % (self.config['performance']['frame_skip'] + 1) == 0:
                     last_detections = self.detect(frame)
-
                 detections = last_detections
-                
-                
-                
+                                           
                 # Draw detections
                 display_frame = self.draw_detections(frame.copy(), detections)
-                
                 # Add FPS overlay
                 if time.time() - fps_time >= 1.0:
                     fps = frame_count
                     frame_count = 0
                     fps_time = time.time()
                     if detections:
-                        print(f"📊 {fps} FPS | Detected: {len(detections)} objects")
+                        print(f"{fps} FPS | Detected: {len(detections)} objects")
                 
                 cv2.putText(display_frame, f"FPS: {fps}", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
                 # Stream frame
                 if self.streamer:
                     self.streamer.update_frame(display_frame)
-                
                 # Throttle to target FPS
                 elapsed = time.time() - start_time
                 target = 1.0 / self.config['performance']['throttle_fps']
                 if elapsed < target:
                     time.sleep(target - elapsed)
-
-                # if time.time() - last_sys_log >= 5.0:
-                #     temp = get_cpu_temp()
-                #     if temp:
-                #         print(
-                #             f"🌡️ CPU: {temp:.1f}°C | "
-                #             f"FPS: {fps} | "
-                #             f"Resolution: {frame.shape[1]}x{frame.shape[0]} | "
-                #             f"Detections: {len(detections)}"
-                #         )
-                #     last_sys_log = time.time()
-                
+             
         except KeyboardInterrupt:
-            print("\n⏹️ Stopping...")
+            print("\n Stopping...")
         finally:
             self.cap.release()
             if self.streamer:
                 self.streamer.stop()
 
-# Main
 if __name__ == "__main__":
-    # Load config (simplified)
+    # Load config 
     config = {
         'system': {
             'enable_streaming': True,
@@ -262,7 +208,7 @@ if __name__ == "__main__":
             'throttle_fps': 15,
             'frame_skip': 2,
             'inference_size': 320,
-            'use_threading': False
+            'use_threading': True,
         },
         'camera': {
             'device_id': 0,
