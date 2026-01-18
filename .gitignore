@@ -22,3 +22,7 @@ train/
 val/
 *.txt
 *.zip
+models/
+*.pt
+*.bin
+*.xml
