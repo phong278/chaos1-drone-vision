@@ -22,46 +22,54 @@ Key goals:
 
 ## Dataset & Classes
 
-Dataset Source
-
-KIIT-MITA Dataset (Kaggle)
-
-`https://www.kaggle.com/datasets/sudipchakrabarty/kiit-mita`
-
-Dataset YAML
+### Dataset YAML (data.yml)
 
 ```yaml
-path: dataset
+path: ..
 
-train: train/images
-val: valid/images
-test: test/images
+train: dataset/train/images
+val: dataset/valid/images
+test: dataset/test/images
 
-nc: 7
+nc: 9
+
 names:
-  - Artillery
-  - Missile
-  - Radar
-  - M. Rocket Launcher
-  - Soldier
-  - Tank
-  - Vehicle
+  0: Artillery
+  1: Missile
+  2: Radar
+  3: M. Rocket Launcher
+  4: Soldier
+  5: Tank
+  6: Vehicle
+  7: Aircraft
+  8: Ships
 ```
 
+### Dataset Composition
+
+The dataset is built on KIIT-MILA, which serves as the base dataset and provides the majority of ground combat classes and imagery.
+Additional datasets were incorporated to extend the class set and improve coverage of aerial and maritime targets.
+
+Base Dataset
+
+- KIIT-MILA (Military Imagery for Target Detection)
+`https://www.kaggle.com/datasets/sudipchakrabarty/kiit-mita`
+
+Used as the foundational dataset for land-based military targets such as tanks, vehicles, artillery, radar, and personnel.
+
+Extended Datasets
+
+- Military Aircraft Detection Dataset
 `https://www.kaggle.com/datasets/a2015003713/militaryaircraftdetectiondataset`
+
+Used to introduce the Aircraft class.
+
+- Ships in Aerial Images Dataset
 `https://www.kaggle.com/datasets/siddharthkumarsah/ships-in-aerial-images`
 
-### Supported Classes
+Used to introduce the Ships class, with controlled subsampling to avoid class imbalance.
 
-| ID | Class |
-| ----------- | ----------- |
-| 0 | Artillery |
-| 1 | Missile |
-| 2 | Radar |
-| 3 | M. Rocket Launcher |
-| 4 | Soldier |
-| 5 | Tank |
-| 6 | Vehicle |
+**All datasets were converted to YOLO format, unified under a consistent class ID mapping, and merged into a single train/validation/test split.**
 
 ## Software Requirements
 
