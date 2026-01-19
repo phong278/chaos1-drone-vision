@@ -29,7 +29,7 @@ class SimpleStreamer:
         while self.running:
             with self.frame_lock:
                 if self.frame is not None:
-                    _, jpeg = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    _, jpeg = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                     if _:
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + 
@@ -237,7 +237,8 @@ class DetectionSystem:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 # Stream frame
                 if self.streamer:
-                    self.streamer.update_frame(display_frame)
+                        stream_frame = cv2.resize(display_frame, (320, 240))
+                        self.streamer.update_frame(stream_frame)
                 # Throttle to target FPS
                 elapsed = time.time() - start_time
                 target = 1.0 / self.config['performance']['throttle_fps']
@@ -260,16 +261,16 @@ if __name__ == "__main__":
             'max_streaming_clients': 5
         },
         'performance': {
-            'throttle_fps': 15,
-            'frame_skip': 2,
-            'inference_size': 640,
+            'throttle_fps': 10,
+            'frame_skip': 4,
+            'inference_size': 320,
             'use_threading': True,
         },
         'camera': {
             'device_id': 0,
-            'width': 1280,
-            'height': 720,
-            'fps': 15,
+            'width': 640,
+            'height': 480,
+            'fps': 10,
             
         },
         'detection': {
