@@ -3,6 +3,8 @@ import cv2
 import time
 import threading
 from ultralytics import YOLO
+import RPi.GPIO as GPIO  # or pigpio, depending on your setup
+import math
 
 def get_cpu_temp():
     try:
@@ -106,13 +108,65 @@ class DetectionSystem:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config['camera']['height'])
         self.cap.set(cv2.CAP_PROP_FPS, config['camera']['fps'])
         
+        #----GIMBAL-----#
+        self.pan_pin = 17   # GPIO pin for pan motor
+        self.tilt_pin = 27  # GPIO pin for tilt motor
+        self.setup_motors()
+        self.pan_angle = 90   # start at neutral
+        self.tilt_angle = 90  # start at neutral
+        self.max_angle = 180
+        self.min_angle = 0
+        self.kp = 0.1  # proportional gain
+        #---------------#
         
         self.streamer = None
         if config['system']['enable_streaming']:
             self.streamer = SimpleStreamer(port=config['system']['streaming_port'])
             threading.Thread(target=self.streamer.run, daemon=True).start()
             time.sleep(1)  
-   
+
+    def setup_motors(self):
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.pan_pin, GPIO.OUT)
+        GPIO.setup(self.tilt_pin, GPIO.OUT)
+        self.pan_pwm = GPIO.PWM(self.pan_pin, 50)
+        self.tilt_pwm = GPIO.PWM(self.tilt_pin, 50)
+        self.pan_pwm.start(7.5)   # neutral
+        self.tilt_pwm.start(7.5)  # neutral
+
+    def move_motors(self, x_offset, y_offset):
+        # P-controller
+        self.pan_angle += self.kp * x_offset
+        self.tilt_angle -= self.kp * y_offset  # usually inverted
+
+        # clamp angles
+        self.pan_angle = max(self.min_angle, min(self.max_angle, self.pan_angle))
+        self.tilt_angle = max(self.min_angle, min(self.max_angle, self.tilt_angle))
+
+        # convert angle to duty cycle for standard servo
+        def angle_to_duty(a):
+            return 2.5 + (a / 180.0) * 10.0
+
+        self.pan_pwm.ChangeDutyCycle(angle_to_duty(self.pan_angle))
+        self.tilt_pwm.ChangeDutyCycle(angle_to_duty(self.tilt_angle))
+
+    def track_object(self, detections, frame):
+        # Simple: take the first detection as target
+        if not detections:
+            return
+        det = detections[0]
+        x1, y1, x2, y2 = det['bbox']
+        obj_x = (x1 + x2) / 2
+        obj_y = (y1 + y2) / 2
+
+        frame_cx = frame.shape[1] / 2
+        frame_cy = frame.shape[0] / 2
+
+        x_offset = obj_x - frame_cx
+        y_offset = obj_y - frame_cy
+
+        self.move_motors(x_offset, y_offset)
+
     def detect(self, frame):
         """Run YOLOv8 detection on frame"""
         inference_size = self.config['performance']['inference_size']
@@ -167,6 +221,7 @@ class DetectionSystem:
                 if frame_count % (self.config['performance']['frame_skip'] + 1) == 0:
                     last_detections = self.detect(frame)
                 detections = last_detections
+                self.track_object(detections, frame)
                                            
                 # Draw detections
                 display_frame = self.draw_detections(frame.copy(), detections)
@@ -207,7 +262,7 @@ if __name__ == "__main__":
         'performance': {
             'throttle_fps': 15,
             'frame_skip': 2,
-            'inference_size': 320,
+            'inference_size': 640,
             'use_threading': True,
         },
         'camera': {
