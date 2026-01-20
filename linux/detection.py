@@ -1,227 +1,165 @@
-#!/usr/bin/env python3
 import cv2
+import numpy as np
+import onnxruntime as ort
 import time
-import threading
-from ultralytics import YOLO
+from gpiozero import Servo, Device
+from gpiozero.pins.lgpio import LGPIOFactory
 
-def get_cpu_temp():
-    try:
-        with open("/sys/class/thermal/thermal_zone0/temp") as f:
-            return int(f.read()) / 1000.0
-    except:
-        return None
+# ================= GPIO =================
+Device.pin_factory = LGPIOFactory()
 
-class SimpleStreamer:
-    def __init__(self, port=5000):
-        self.port = port
-        self.frame = None
-        self.frame_lock = threading.Lock()
-        self.running = False
-        self.thread = None
-        
-    def update_frame(self, frame):
-        with self.frame_lock:
-            self.frame = frame
-    
-    def _generate_frame(self):
-        while self.running:
-            with self.frame_lock:
-                if self.frame is not None:
-                    _, jpeg = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    if _:
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + 
-                               jpeg.tobytes() + b'\r\n')
-            time.sleep(0.033)  
-    
-    def run(self):
-        try:
-          
-            from http.server import HTTPServer, BaseHTTPRequestHandler
-            
-            class StreamingHandler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    if self.path == '/stream.mjpg':
-                        self.send_response(200)
-                        self.send_header('Content-Type', 
-                                       'multipart/x-mixed-replace; boundary=frame')
-                        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-                        self.end_headers()
-                        
-                        for frame in self.server.streamer._generate_frame():
-                            try:
-                                self.wfile.write(frame)
-                            except:
-                                break
-                    elif self.path == '/':
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html')
-                        self.end_headers()
-                        self.wfile.write(b'''
-                        <html><head><title>Camera Stream</title></head>
-                        <body style="margin:0;background:#000;">
-                            <img src="/stream.mjpg">
-                        </body></html>
-                        ''')
-            
-            class StreamingServer(HTTPServer):
-                def __init__(self, *args, **kwargs):
-                    self.streamer = kwargs.pop('streamer')
-                    super().__init__(*args, **kwargs)
-            
-            self.running = True
-            server = StreamingServer(('0.0.0.0', self.port), StreamingHandler, streamer=self)
-            print(f"Streaming at http://localhost:{self.port}")
-            print(f"Network: http://{self._get_ip()}:{self.port}")
-            server.serve_forever()
-            
-        except Exception as e:
-            print(f"Streaming error: {e}")
-    
-    def _get_ip(self):
-        import socket
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('8.8.8.8', 1))
-            return s.getsockname()[0]
-        except:
-            return "YOUR_PI_IP"
-        
-    def stop(self):
-        self.running = False
+pan_servo  = Servo(18, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+tilt_servo = Servo(13, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+roll_servo = Servo(12, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
 
-# Core Detection System
-class DetectionSystem:
-    def __init__(self, config):
-        self.config = config
-        self.model = YOLO('models/openvino/')
-        self.model.conf = config['detection']['confidence']
-        # Initialize camera
-        self.cap = cv2.VideoCapture(
-            config['camera']['device_id'],
-            cv2.CAP_V4L2
-        )
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config['camera']['width'])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config['camera']['height'])
-        self.cap.set(cv2.CAP_PROP_FPS, config['camera']['fps'])
-        
-        
-        self.streamer = None
-        if config['system']['enable_streaming']:
-            self.streamer = SimpleStreamer(port=config['system']['streaming_port'])
-            threading.Thread(target=self.streamer.run, daemon=True).start()
-            time.sleep(1)  
-   
-    def detect(self, frame):
-        """Run YOLOv8 detection on frame"""
-        inference_size = self.config['performance']['inference_size']
-        results = self.model(frame, imgsz=inference_size, conf=self.config['detection']['confidence'], verbose=False)
-        detections = []
-        if results and results[0].boxes is not None:
-            for box in results[0].boxes:
-                conf = float(box.conf[0])
-                if conf < self.config['detection']['confidence']:
-                    continue
-                class_id = int(box.cls[0])
-                label = self.model.names[class_id] if class_id < len(self.model.names) else 'object'
-                detections.append({
-                    'label': label,
-                    'confidence': conf,
-                    'bbox': box.xyxy[0].cpu().numpy().astype(int)
-                })           
-        return detections
-    
-    def draw_detections(self, frame, detections):
-        """Draw detections on frame"""
-        for det in detections:
-            x1, y1, x2, y2 = det['bbox']
-            label = det['label']
-            conf = det['confidence']
-            
-            # Draw box and label
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label_text = f"{label}: {conf:.1%}"
-            cv2.putText(frame, label_text, (x1, y1-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        return frame
-    
-    def run(self):
-        print("Starting Object Detection")
-        print(f"Camera: {self.config['camera']['width']}x{self.config['camera']['height']}")
-        print(f"Confidence: {self.config['detection']['confidence']}")
-        frame_count = 0
-        fps_time = time.time()
-        fps = 0
-        
-        last_detections = []
-        try:
-            while True:
-                start_time = time.time()
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("❌ Camera error")
-                    break
-                frame_count += 1
-                # Frame skipping
-                if frame_count % (self.config['performance']['frame_skip'] + 1) == 0:
-                    last_detections = self.detect(frame)
-                detections = last_detections
-                                           
-                # Draw detections
-                display_frame = self.draw_detections(frame.copy(), detections)
-                # Add FPS overlay
-                if time.time() - fps_time >= 1.0:
-                    fps = frame_count
-                    frame_count = 0
-                    fps_time = time.time()
-                    if detections:
-                        print(f"{fps} FPS | Detected: {len(detections)} objects")
-                
-                cv2.putText(display_frame, f"FPS: {fps}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                # Stream frame
-                if self.streamer:
-                    self.streamer.update_frame(display_frame)
-                # Throttle to target FPS
-                elapsed = time.time() - start_time
-                target = 1.0 / self.config['performance']['throttle_fps']
-                if elapsed < target:
-                    time.sleep(target - elapsed)
-             
-        except KeyboardInterrupt:
-            print("\n Stopping...")
-        finally:
-            self.cap.release()
-            if self.streamer:
-                self.streamer.stop()
+pan = tilt = roll = 0.0
 
-if __name__ == "__main__":
-    # Load config 
-    config = {
-        'system': {
-            'enable_streaming': True,
-            'streaming_port': 5000,
-            'max_streaming_clients': 5
-        },
-        'performance': {
-            'throttle_fps': 15,
-            'frame_skip': 2,
-            'inference_size': 320,
-            'use_threading': True,
-        },
-        'camera': {
-            'device_id': 0,
-            'width': 1280,
-            'height': 720,
-            'fps': 15,
-            
-        },
-        'detection': {
-            'model_cfg': 'yolov8n.pt',
-            'confidence': 0.4
-        }
-    }
-    
-    detector = DetectionSystem(config)
-    detector.run()
+# ================= CAMERA =================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 424)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+# ================= YOLOv8 ONNX =================
+MODEL_PATH = "yolov8n.onnx"
+YOLO_CONF = 0.4
+YOLO_INTERVAL = 0.1
+PERSON_TIMEOUT = 1.0
+
+sess = ort.InferenceSession(
+    MODEL_PATH,
+    providers=["CPUExecutionProvider"]
+)
+yolo_input = sess.get_inputs()[0].name
+
+last_yolo_time = 0
+last_person_time = 0
+person_box = None
+
+# ================= SERVO TUNING =================
+DEADZONE = 15
+GAIN = 0.002
+MAX_STEP = 0.03
+KEY_STEP = 0.1
+
+print("🟢 YOLO-only person tracking (ESC to quit)")
+
+# ================= YOLO FUNCTION =================
+def run_yolo(frame):
+    h, w, _ = frame.shape
+
+    img = cv2.resize(frame, (640, 640))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
+
+    output = sess.run(None, {yolo_input: img})[0]
+    output = np.squeeze(output)
+
+    boxes = output[:4, :]
+    scores = output[4:, :]
+
+    class_ids = np.argmax(scores, axis=0)
+    confidences = scores[class_ids, np.arange(scores.shape[1])]
+
+    best = None
+    best_conf = 0
+
+    for i in range(scores.shape[1]):
+        if class_ids[i] == 0 and confidences[i] > YOLO_CONF:
+            if confidences[i] > best_conf:
+                cx, cy, bw, bh = boxes[:, i]
+                x1 = int((cx - bw / 2) * w)
+                y1 = int((cy - bh / 2) * h)
+                x2 = int((cx + bw / 2) * w)
+                y2 = int((cy + bh / 2) * h)
+                best = (x1, y1, x2, y2, confidences[i])
+                best_conf = confidences[i]
+
+    return best
+
+# ================= MAIN LOOP =================
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    cx_frame, cy_frame = w // 2, h // 2
+    now = time.time()
+
+    # ---------- YOLO ----------
+    if now - last_yolo_time > YOLO_INTERVAL:
+        last_yolo_time = now
+        result = run_yolo(frame)
+        if result:
+            person_box = result
+            last_person_time = now
+
+    # ---------- OPTION A: AUTO-RECENTER ----------
+    if now - last_person_time > PERSON_TIMEOUT:
+        person_box = None
+        pan = 0.0
+        tilt = 0.0
+        roll = 0.0
+
+    # ---------- CONTROL POINT ----------
+    if person_box:
+        x1, y1, x2, y2, conf = person_box
+        target_x = (x1 + x2) // 2
+        target_y = (y1 + y2) // 2
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.circle(frame, (target_x, target_y), 6, (255, 255, 0), -1)
+        cv2.putText(frame, f"PERSON {conf:.2f}",
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 0, 0), 2)
+    else:
+        target_x, target_y = cx_frame, cy_frame
+
+    # ---------- SERVO CONTROL ----------
+    error_x = target_x - cx_frame
+    error_y = target_y - cy_frame
+
+    if abs(error_x) > DEADZONE:
+        pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
+
+    if abs(error_y) > DEADZONE:
+        tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
+
+    # ---------- MANUAL DEBUG ----------
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == 27:
+        break
+    elif key == ord('r'):
+        pan = tilt = roll = 0.0
+    elif key == 81:
+        pan -= KEY_STEP
+    elif key == 83:
+        pan += KEY_STEP
+    elif key == 82:
+        tilt -= KEY_STEP
+    elif key == 84:
+        tilt += KEY_STEP
+
+    # ---------- CLAMP + OUTPUT ----------
+    pan  = max(-1.0, min(1.0, pan))
+    tilt = max(-1.0, min(1.0, tilt))
+    roll = 0.0
+
+    pan_servo.value  = pan
+    tilt_servo.value = tilt
+    roll_servo.value = roll
+
+    # ---------- UI ----------
+    cv2.drawMarker(frame, (cx_frame, cy_frame),
+                   (255, 255, 255),
+                   cv2.MARKER_CROSS, 20, 2)
+
+    cv2.imshow("YOLO Person Tracker", frame)
+
+cap.release()
+cv2.destroyAllWindows()
