@@ -1,98 +1,43 @@
 #!/usr/bin/env python3
 import cv2
 import time
-import math
 from ultralytics import YOLO
 
-# ---------------- GPIO SAFE IMPORT ----------------
-try:
-    import RPi.GPIO as GPIO
-except ImportError:
-    GPIO = None
-    print("⚠️ GPIO not available")
+from gpiozero import Servo, Device
+from gpiozero.pins.lgpio import LGPIOFactory
 
-# -------------------------------------------------
-def get_cpu_temp():
-    try:
-        with open("/sys/class/thermal/thermal_zone0/temp") as f:
-            return int(f.read()) / 1000.0
-    except:
-        return None
+# ================= GPIO =================
+Device.pin_factory = LGPIOFactory()
+
+pan_servo  = Servo(17, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+tilt_servo = Servo(27, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+
+pan = 0.0
+tilt = 0.0
+
+DEADZONE = 15
+GAIN = 0.002
+MAX_STEP = 0.03
 
 # ================== DETECTION SYSTEM ==================
 class DetectionSystem:
     def __init__(self, config):
         self.config = config
 
-        # -------- MODEL --------
         self.model = YOLO("models/openvino/")
         self.model.conf = config["detection"]["confidence"]
 
-        # -------- CAMERA --------
-        self.cap = cv2.VideoCapture(config["camera"]["device_id"], cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config["camera"]["width"])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config["camera"]["height"])
-        self.cap.set(cv2.CAP_PROP_FPS, config["camera"]["fps"])
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-        # -------- GIMBAL --------
-        self.pan_pin = 17
-        self.tilt_pin = 27
-        self.pan_angle = 90
-        self.tilt_angle = 90
-        self.max_angle = 180
-        self.min_angle = 0
-        self.kp = 0.1
-
-        if GPIO:
-            self.setup_motors()
-
-    # ---------------- GPIO ----------------
-    def setup_motors(self):
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.pan_pin, GPIO.OUT)
-        GPIO.setup(self.tilt_pin, GPIO.OUT)
-        self.pan_pwm = GPIO.PWM(self.pan_pin, 50)
-        self.tilt_pwm = GPIO.PWM(self.tilt_pin, 50)
-        self.pan_pwm.start(7.5)
-        self.tilt_pwm.start(7.5)
-
-    def move_motors(self, x_offset, y_offset):
-        if not GPIO:
-            return
-
-        self.pan_angle += self.kp * x_offset
-        self.tilt_angle -= self.kp * y_offset
-
-        self.pan_angle = max(self.min_angle, min(self.max_angle, self.pan_angle))
-        self.tilt_angle = max(self.min_angle, min(self.max_angle, self.tilt_angle))
-
-        def angle_to_duty(a):
-            return 2.5 + (a / 180.0) * 10.0
-
-        self.pan_pwm.ChangeDutyCycle(angle_to_duty(self.pan_angle))
-        self.tilt_pwm.ChangeDutyCycle(angle_to_duty(self.tilt_angle))
-
-    # ---------------- TRACKING ----------------
-    def track_object(self, detections, frame):
-        if not detections:
-            return
-
-        det = detections[0]
-        x1, y1, x2, y2 = det["bbox"]
-        obj_x = (x1 + x2) / 2
-        obj_y = (y1 + y2) / 2
-
-        frame_cx = frame.shape[1] / 2
-        frame_cy = frame.shape[0] / 2
-
-        self.move_motors(obj_x - frame_cx, obj_y - frame_cy)
+        self.last_detections = []
 
     # ---------------- DETECTION ----------------
     def detect(self, frame):
         results = self.model(
             frame,
-            imgsz=self.config["performance"]["inference_size"],
+            imgsz=640,
             conf=self.config["detection"]["confidence"],
             verbose=False,
         )
@@ -104,103 +49,87 @@ class DetectionSystem:
                 if conf < self.config["detection"]["confidence"]:
                     continue
                 class_id = int(box.cls[0])
-                label = self.model.names[class_id]
-                detections.append(
-                    {
-                        "label": label,
-                        "confidence": conf,
-                        "bbox": box.xyxy[0].cpu().numpy().astype(int),
-                    }
-                )
+                if class_id != 0:  # PERSON ONLY
+                    continue
+
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                detections.append((x1, y1, x2, y2, conf))
+
         return detections
 
-    # ---------------- DRAW ----------------
-    def draw_detections(self, frame, detections):
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            label = f"{det['label']} {det['confidence']:.1%}"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                frame,
-                label,
-                (x1, y1 - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                2,
-            )
-        return frame
+    # ---------------- TRACKING (FIXED) ----------------
+    def track_object(self, detections, frame):
+        global pan, tilt
+
+        if not detections:
+            return
+
+        x1, y1, x2, y2, _ = detections[0]
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        h, w, _ = frame.shape
+        cx_frame = w // 2
+        cy_frame = h // 2
+
+        error_x = cx - cx_frame
+        error_y = cy - cy_frame
+
+        if abs(error_x) > DEADZONE:
+            pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
+
+        if abs(error_y) > DEADZONE:
+            tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
+
+        pan = max(-1.0, min(1.0, pan))
+        tilt = max(-1.0, min(1.0, tilt))
+
+        pan_servo.value = pan
+        tilt_servo.value = tilt
 
     # ---------------- MAIN LOOP ----------------
     def run(self):
-        print("Starting Object Detection (local preview)")
         frame_count = 0
-        fps_time = time.time()
-        fps = 0
-        last_detections = []
 
-        try:
-            while True:
-                start = time.time()
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("❌ Camera error")
-                    break
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
 
-                frame_count += 1
+            frame = cv2.flip(frame, 1)
+            frame_count += 1
 
-                if frame_count % (self.config["performance"]["frame_skip"] + 1) == 0:
-                    last_detections = self.detect(frame)
+            if frame_count % (self.config["performance"]["frame_skip"] + 1) == 0:
+                self.last_detections = self.detect(frame)
 
-                self.track_object(last_detections, frame)
+            self.track_object(self.last_detections, frame)
 
-                display_frame = frame
-                self.draw_detections(display_frame, last_detections)
+            for x1, y1, x2, y2, conf in self.last_detections:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"PERSON {conf:.2f}",
+                            (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 255, 0), 2)
 
-                if time.time() - fps_time >= 1.0:
-                    fps = frame_count
-                    frame_count = 0
-                    fps_time = time.time()
+            h, w, _ = frame.shape
+            cv2.drawMarker(frame, (w//2, h//2),
+                           (255,255,255),
+                           cv2.MARKER_CROSS, 20, 2)
 
-                cv2.putText(
-                    display_frame,
-                    f"FPS: {fps}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
+            cv2.imshow("YOLO Servo Tracker", frame)
 
-                # ---- LOCAL PREVIEW (FAST) ----
-                cv2.imshow("YOLO Preview", display_frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
 
-                elapsed = time.time() - start
-                target = 1.0 / self.config["performance"]["throttle_fps"]
-                if elapsed < target:
-                    time.sleep(target - elapsed)
-
-        finally:
-            self.cap.release()
-            cv2.destroyAllWindows()
-            if GPIO:
-                GPIO.cleanup()
+        self.cap.release()
+        cv2.destroyAllWindows()
 
 # ================== MAIN ==================
 if __name__ == "__main__":
     config = {
         "performance": {
-            "throttle_fps": 10,
             "frame_skip": 4,
-            "inference_size": 640,  # MUST stay 640
-        },
-        "camera": {
-            "device_id": 0,
-            "width": 640,
-            "height": 480,
-            "fps": 10,
         },
         "detection": {
             "confidence": 0.4,
