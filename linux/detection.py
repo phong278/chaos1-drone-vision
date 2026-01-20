@@ -1,145 +1,165 @@
-#!/usr/bin/env python3
 import cv2
+import numpy as np
+import onnxruntime as ort
 import time
-from ultralytics import YOLO
 from gpiozero import Servo, Device
 from gpiozero.pins.lgpio import LGPIOFactory
 
 # ================= GPIO =================
 Device.pin_factory = LGPIOFactory()
-pan_servo  = Servo(17, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
-tilt_servo = Servo(27, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
 
-pan = 0.0
-tilt = 0.0
+pan_servo  = Servo(18, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+tilt_servo = Servo(13, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+roll_servo = Servo(12, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
 
+pan = tilt = roll = 0.0
+
+# ================= CAMERA =================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 424)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+# ================= YOLOv8 ONNX =================
+MODEL_PATH = "yolov8n.onnx"
+YOLO_CONF = 0.4
+YOLO_INTERVAL = 0.1
+PERSON_TIMEOUT = 1.0
+
+sess = ort.InferenceSession(
+    MODEL_PATH,
+    providers=["CPUExecutionProvider"]
+)
+yolo_input = sess.get_inputs()[0].name
+
+last_yolo_time = 0
+last_person_time = 0
+person_box = None
+
+# ================= SERVO TUNING =================
 DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
+KEY_STEP = 0.1
 
-# ================= CUSTOM CLASS NAMES =================
-CLASS_NAMES = [
-    "artillery", "missile", "radar", "m. rocket launcher", "soldier",
-    "tank", "vehicle", "aircraft", "ships"
-]
+print("🟢 YOLO-only person tracking (ESC to quit)")
 
-# ================== DETECTION SYSTEM ==================
-class DetectionSystem:
-    def __init__(self, config):
-        self.config = config
+# ================= YOLO FUNCTION =================
+def run_yolo(frame):
+    h, w, _ = frame.shape
 
-        # ---------- LOAD ONNX MODEL ----------
-        self.model = YOLO("models/onnx/best.onnx", task="detect")
-        self.model.conf = config["detection"]["confidence"]
+    img = cv2.resize(frame, (640, 640))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    img = np.expand_dims(img, axis=0)
 
-        # ---------- CAMERA ----------
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    output = sess.run(None, {yolo_input: img})[0]
+    output = np.squeeze(output)
 
-        self.last_detections = []
+    boxes = output[:4, :]
+    scores = output[4:, :]
 
-    # ---------------- DETECTION ----------------
-    def detect(self, frame):
-        results = self.model(
-            frame,
-            imgsz=640,
-            conf=self.config["detection"]["confidence"],
-            verbose=False
-        )
+    class_ids = np.argmax(scores, axis=0)
+    confidences = scores[class_ids, np.arange(scores.shape[1])]
 
-        detections = []
-        if results and results[0].boxes is not None:
-            for box in results[0].boxes:
-                conf = float(box.conf[0])
-                if conf < self.config["detection"]["confidence"]:
-                    continue
-                class_id = int(box.cls[0])
-                # Only track the first class in CLASS_NAMES
-                if class_id != 0:
-                    continue
+    best = None
+    best_conf = 0
 
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                detections.append((x1, y1, x2, y2, conf))
+    for i in range(scores.shape[1]):
+        if class_ids[i] == 0 and confidences[i] > YOLO_CONF:
+            if confidences[i] > best_conf:
+                cx, cy, bw, bh = boxes[:, i]
+                x1 = int((cx - bw / 2) * w)
+                y1 = int((cy - bh / 2) * h)
+                x2 = int((cx + bw / 2) * w)
+                y2 = int((cy + bh / 2) * h)
+                best = (x1, y1, x2, y2, confidences[i])
+                best_conf = confidences[i]
 
-        return detections
+    return best
 
-    # ---------------- TRACKING ----------------
-    def track_object(self, detections, frame):
-        global pan, tilt
+# ================= MAIN LOOP =================
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
 
-        if not detections:
-            return
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    cx_frame, cy_frame = w // 2, h // 2
+    now = time.time()
 
-        x1, y1, x2, y2, _ = detections[0]
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
+    # ---------- YOLO ----------
+    if now - last_yolo_time > YOLO_INTERVAL:
+        last_yolo_time = now
+        result = run_yolo(frame)
+        if result:
+            person_box = result
+            last_person_time = now
 
-        h, w, _ = frame.shape
-        cx_frame = w // 2
-        cy_frame = h // 2
+    # ---------- OPTION A: AUTO-RECENTER ----------
+    if now - last_person_time > PERSON_TIMEOUT:
+        person_box = None
+        pan = 0.0
+        tilt = 0.0
+        roll = 0.0
 
-        error_x = cx - cx_frame
-        error_y = cy - cy_frame
+    # ---------- CONTROL POINT ----------
+    if person_box:
+        x1, y1, x2, y2, conf = person_box
+        target_x = (x1 + x2) // 2
+        target_y = (y1 + y2) // 2
 
-        if abs(error_x) > DEADZONE:
-            pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.circle(frame, (target_x, target_y), 6, (255, 255, 0), -1)
+        cv2.putText(frame, f"PERSON {conf:.2f}",
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 0, 0), 2)
+    else:
+        target_x, target_y = cx_frame, cy_frame
 
-        if abs(error_y) > DEADZONE:
-            tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
+    # ---------- SERVO CONTROL ----------
+    error_x = target_x - cx_frame
+    error_y = target_y - cy_frame
 
-        pan = max(-1.0, min(1.0, pan))
-        tilt = max(-1.0, min(1.0, tilt))
+    if abs(error_x) > DEADZONE:
+        pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
 
-        pan_servo.value = pan
-        tilt_servo.value = tilt
+    if abs(error_y) > DEADZONE:
+        tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
 
-    # ---------------- MAIN LOOP ----------------
-    def run(self):
-        frame_count = 0
-        try:
-            while True:
-                ret, frame = self.cap.read()
-                if not ret:
-                    continue
+    # ---------- MANUAL DEBUG ----------
+    key = cv2.waitKey(1) & 0xFF
 
-                frame = cv2.flip(frame, 1)
-                frame_count += 1
+    if key == 27:
+        break
+    elif key == ord('r'):
+        pan = tilt = roll = 0.0
+    elif key == 81:
+        pan -= KEY_STEP
+    elif key == 83:
+        pan += KEY_STEP
+    elif key == 82:
+        tilt -= KEY_STEP
+    elif key == 84:
+        tilt += KEY_STEP
 
-                # Run detection on every Nth frame
-                if frame_count % (self.config["performance"]["frame_skip"] + 1) == 0:
-                    self.last_detections = self.detect(frame)
+    # ---------- CLAMP + OUTPUT ----------
+    pan  = max(-1.0, min(1.0, pan))
+    tilt = max(-1.0, min(1.0, tilt))
+    roll = 0.0
 
-                self.track_object(self.last_detections, frame)
+    pan_servo.value  = pan
+    tilt_servo.value = tilt
+    roll_servo.value = roll
 
-                # Draw bounding boxes
-                for x1, y1, x2, y2, conf in self.last_detections:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"{CLASS_NAMES[0]} {conf:.2f}"  # Only first class
-                    cv2.putText(frame, label, (x1, y1-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    # ---------- UI ----------
+    cv2.drawMarker(frame, (cx_frame, cy_frame),
+                   (255, 255, 255),
+                   cv2.MARKER_CROSS, 20, 2)
 
-                # Draw center marker
-                h, w, _ = frame.shape
-                cv2.drawMarker(frame, (w//2, h//2), (255,255,255), cv2.MARKER_CROSS, 20, 2)
+    cv2.imshow("YOLO Person Tracker", frame)
 
-                # Show frame
-                cv2.imshow("YOLO Servo Tracker", frame)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
-        finally:
-            self.cap.release()
-            cv2.destroyAllWindows()
-
-# ================== MAIN ==================
-if __name__ == "__main__":
-    config = {
-        "performance": {
-            "frame_skip": 4,
-        },
-        "detection": {
-            "confidence": 0.2,
-        },
-    }
-
-    DetectionSystem(config).run()
+cap.release()
+cv2.destroyAllWindows()
