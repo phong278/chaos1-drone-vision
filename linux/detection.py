@@ -17,6 +17,12 @@ DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
 
+# ================= CUSTOM CLASS NAMES =================
+CLASS_NAMES = [
+    "artillery", "missile", "radar", "m. rocket launcher", "soldier",
+    "tank", "vehicle", "aircraft", "ships"
+]
+
 # ================== DETECTION SYSTEM ==================
 class DetectionSystem:
     def __init__(self, config):
@@ -25,9 +31,6 @@ class DetectionSystem:
         # ---------- LOAD ONNX MODEL ----------
         self.model = YOLO("models/onnx/best.onnx", task="detect")
         self.model.conf = config["detection"]["confidence"]
-
-        # Force correct class names (replace with your dataset classes)
-        self.model.names = ["artillery", "missile", "radar","m. rocket launcher","soldier","tank","vehicle","aircraft","ships"]  # <-- put your real classes here
 
         # ---------- CAMERA ----------
         self.cap = cv2.VideoCapture(0)
@@ -52,9 +55,10 @@ class DetectionSystem:
                 if conf < self.config["detection"]["confidence"]:
                     continue
                 class_id = int(box.cls[0])
-                # Only track the first class of your dataset
+                # Only track the first class in CLASS_NAMES
                 if class_id != 0:
                     continue
+
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 detections.append((x1, y1, x2, y2, conf))
 
@@ -111,7 +115,7 @@ class DetectionSystem:
                 # Draw bounding boxes
                 for x1, y1, x2, y2, conf in self.last_detections:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"{self.model.names[0]} {conf:.2f}"  # Only first class
+                    label = f"{CLASS_NAMES[0]} {conf:.2f}"  # Only first class
                     cv2.putText(frame, label, (x1, y1-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
