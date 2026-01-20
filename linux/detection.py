@@ -2,13 +2,11 @@
 import cv2
 import time
 from ultralytics import YOLO
-
 from gpiozero import Servo, Device
 from gpiozero.pins.lgpio import LGPIOFactory
 
 # ================= GPIO =================
 Device.pin_factory = LGPIOFactory()
-
 pan_servo  = Servo(17, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
 tilt_servo = Servo(27, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
 
@@ -24,9 +22,14 @@ class DetectionSystem:
     def __init__(self, config):
         self.config = config
 
-        self.model = YOLO("models/openvino/")
+        # ---------- LOAD ONNX MODEL ----------
+        self.model = YOLO("models/onnx/best.onnx", task="detect")
         self.model.conf = config["detection"]["confidence"]
 
+        # Force correct class names (replace with your dataset classes)
+        self.model.names = ["artillery", "missile", "radar","m. rocket launcher","soldier","tank","vehicle","aircraft","ships"]  # <-- put your real classes here
+
+        # ---------- CAMERA ----------
         self.cap = cv2.VideoCapture(0)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -39,7 +42,7 @@ class DetectionSystem:
             frame,
             imgsz=640,
             conf=self.config["detection"]["confidence"],
-            verbose=False,
+            verbose=False
         )
 
         detections = []
@@ -49,15 +52,15 @@ class DetectionSystem:
                 if conf < self.config["detection"]["confidence"]:
                     continue
                 class_id = int(box.cls[0])
-                if class_id != 0:  # PERSON ONLY
+                # Only track the first class of your dataset
+                if class_id != 0:
                     continue
-
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 detections.append((x1, y1, x2, y2, conf))
 
         return detections
 
-    # ---------------- TRACKING (FIXED) ----------------
+    # ---------------- TRACKING ----------------
     def track_object(self, detections, frame):
         global pan, tilt
 
@@ -65,7 +68,6 @@ class DetectionSystem:
             return
 
         x1, y1, x2, y2, _ = detections[0]
-
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
 
@@ -91,39 +93,39 @@ class DetectionSystem:
     # ---------------- MAIN LOOP ----------------
     def run(self):
         frame_count = 0
+        try:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    continue
 
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
+                frame = cv2.flip(frame, 1)
+                frame_count += 1
 
-            frame = cv2.flip(frame, 1)
-            frame_count += 1
+                # Run detection on every Nth frame
+                if frame_count % (self.config["performance"]["frame_skip"] + 1) == 0:
+                    self.last_detections = self.detect(frame)
 
-            if frame_count % (self.config["performance"]["frame_skip"] + 1) == 0:
-                self.last_detections = self.detect(frame)
+                self.track_object(self.last_detections, frame)
 
-            self.track_object(self.last_detections, frame)
+                # Draw bounding boxes
+                for x1, y1, x2, y2, conf in self.last_detections:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"{self.model.names[0]} {conf:.2f}"  # Only first class
+                    cv2.putText(frame, label, (x1, y1-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            for x1, y1, x2, y2, conf in self.last_detections:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"PERSON {conf:.2f}",
-                            (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 255, 0), 2)
+                # Draw center marker
+                h, w, _ = frame.shape
+                cv2.drawMarker(frame, (w//2, h//2), (255,255,255), cv2.MARKER_CROSS, 20, 2)
 
-            h, w, _ = frame.shape
-            cv2.drawMarker(frame, (w//2, h//2),
-                           (255,255,255),
-                           cv2.MARKER_CROSS, 20, 2)
-
-            cv2.imshow("YOLO Servo Tracker", frame)
-
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
-
-        self.cap.release()
-        cv2.destroyAllWindows()
+                # Show frame
+                cv2.imshow("YOLO Servo Tracker", frame)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+        finally:
+            self.cap.release()
+            cv2.destroyAllWindows()
 
 # ================== MAIN ==================
 if __name__ == "__main__":
@@ -132,7 +134,7 @@ if __name__ == "__main__":
             "frame_skip": 4,
         },
         "detection": {
-            "confidence": 0.4,
+            "confidence": 0.2,
         },
     }
 
