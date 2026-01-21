@@ -28,10 +28,7 @@ YOLO_CONF = 0.4
 YOLO_INTERVAL = 0.1
 PERSON_TIMEOUT = 1.0
 
-sess = ort.InferenceSession(
-    MODEL_PATH,
-    providers=["CPUExecutionProvider"]
-)
+sess = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
 yolo_input = sess.get_inputs()[0].name
 
 last_yolo_time = 0
@@ -43,26 +40,23 @@ DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
 
-## ================= STREAMING =================
+# ================= STREAMING =================
 STREAM_PORT = 5000
 stream_frame = None
 stream_lock = threading.Lock()
 
 def mjpeg_server():
-    print(f"🌐 MJPEG stream ready at http://<pi-ip>:{STREAM_PORT}")
-
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("", STREAM_PORT))
     server.listen(1)
+    print(f"🌐 Stream: http://<pi-ip>:{STREAM_PORT}")
 
     while True:
         conn, _ = server.accept()
         try:
             conn.sendall(
                 b"HTTP/1.0 200 OK\r\n"
-                b"Cache-Control: no-cache\r\n"
-                b"Pragma: no-cache\r\n"
                 b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
             )
 
@@ -74,17 +68,14 @@ def mjpeg_server():
                     time.sleep(0.05)
                     continue
 
-                frame = cv2.resize(frame, (320, 180))
                 ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
                 if not ok:
                     continue
 
-                conn.sendall(b"--frame\r\n")
-                conn.sendall(b"Content-Type: image/jpeg\r\n\r\n")
+                conn.sendall(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
                 conn.sendall(jpg.tobytes())
                 conn.sendall(b"\r\n")
-
-                time.sleep(0.1)  # ~10 FPS
+                time.sleep(0.1)
         except:
             pass
         finally:
@@ -92,7 +83,7 @@ def mjpeg_server():
 
 threading.Thread(target=mjpeg_server, daemon=True).start()
 
-# ================= YOLO FUNCTION =================
+# ================= YOLO FUNCTION (WORKING ONE) =================
 def run_yolo(frame):
     h, w, _ = frame.shape
 
@@ -102,30 +93,28 @@ def run_yolo(frame):
     img = np.transpose(img, (2, 0, 1))
     img = np.expand_dims(img, axis=0)
 
-    preds = sess.run(None, {yolo_input: img})[0]
-    preds = preds[0]  # shape: (8400, 84)
+    output = sess.run(None, {yolo_input: img})[0]
+    output = np.squeeze(output)
+
+    boxes = output[:4, :]
+    scores = output[4:, :]
+
+    class_ids = np.argmax(scores, axis=0)
+    confidences = scores[class_ids, np.arange(scores.shape[1])]
 
     best = None
     best_conf = 0.0
 
-    for det in preds:
-        cx, cy, bw, bh = det[:4]
-        scores = det[4:]
-        class_id = np.argmax(scores)
-        conf = scores[class_id]
-
-        # PERSON = class 0 in yolov8n COCO
-        if class_id != 0 or conf < YOLO_CONF:
-            continue
-
-        x1 = int((cx - bw / 2) * w)
-        y1 = int((cy - bh / 2) * h)
-        x2 = int((cx + bw / 2) * w)
-        y2 = int((cy + bh / 2) * h)
-
-        if conf > best_conf:
-            best = (x1, y1, x2, y2, conf)
-            best_conf = conf
+    for i in range(scores.shape[1]):
+        if class_ids[i] == 0 and confidences[i] > YOLO_CONF:
+            if confidences[i] > best_conf:
+                cx, cy, bw, bh = boxes[:, i]
+                x1 = int((cx - bw / 2) * w)
+                y1 = int((cy - bh / 2) * h)
+                x2 = int((cx + bw / 2) * w)
+                y2 = int((cy + bh / 2) * h)
+                best = (x1, y1, x2, y2, confidences[i])
+                best_conf = confidences[i]
 
     return best
 
@@ -152,9 +141,15 @@ while True:
         pan = tilt = roll = 0.0
 
     if person_box:
-        x1, y1, x2, y2, _ = person_box
+        x1, y1, x2, y2, conf = person_box
         target_x = (x1 + x2) // 2
         target_y = (y1 + y2) // 2
+
+        # ✅ DRAW FOR STREAM
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(frame, f"PERSON {conf:.2f}",
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
     else:
         target_x, target_y = cx_frame, cy_frame
 
