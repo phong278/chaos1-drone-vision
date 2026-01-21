@@ -43,50 +43,54 @@ DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
 
-# ================= STREAMING =================
+## ================= STREAMING =================
 STREAM_PORT = 5000
 stream_frame = None
 stream_lock = threading.Lock()
 
 def mjpeg_server():
-    global stream_frame
+    print(f"🌐 MJPEG stream ready at http://<pi-ip>:{STREAM_PORT}")
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("", STREAM_PORT))
     server.listen(1)
 
-    print(f"🌐 MJPEG stream at http://<pi-ip>:{STREAM_PORT}")
+    while True:
+        conn, _ = server.accept()
+        try:
+            conn.sendall(
+                b"HTTP/1.0 200 OK\r\n"
+                b"Cache-Control: no-cache\r\n"
+                b"Pragma: no-cache\r\n"
+                b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+            )
 
-    conn, _ = server.accept()
-    conn.sendall(
-        b"HTTP/1.0 200 OK\r\n"
-        b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
-    )
+            while True:
+                with stream_lock:
+                    frame = None if stream_frame is None else stream_frame.copy()
 
-    try:
-        while True:
-            with stream_lock:
-                if stream_frame is None:
+                if frame is None:
+                    time.sleep(0.05)
                     continue
-                frame = stream_frame.copy()
 
-            frame = cv2.resize(frame, (320, 180))
-            _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                frame = cv2.resize(frame, (320, 180))
+                ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                if not ok:
+                    continue
 
-            conn.sendall(b"--frame\r\n")
-            conn.sendall(b"Content-Type: image/jpeg\r\n\r\n")
-            conn.sendall(jpg.tobytes())
-            conn.sendall(b"\r\n")
+                conn.sendall(b"--frame\r\n")
+                conn.sendall(b"Content-Type: image/jpeg\r\n\r\n")
+                conn.sendall(jpg.tobytes())
+                conn.sendall(b"\r\n")
 
-            time.sleep(0.1)  # ~10 FPS
-    except:
-        pass
-    finally:
-        conn.close()
-        server.close()
+                time.sleep(0.1)  # ~10 FPS
+        except:
+            pass
+        finally:
+            conn.close()
 
 threading.Thread(target=mjpeg_server, daemon=True).start()
-
-print("🟢 Headless YOLO person tracking running")
 
 # ================= YOLO FUNCTION =================
 def run_yolo(frame):
