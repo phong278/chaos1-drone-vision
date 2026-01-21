@@ -102,28 +102,30 @@ def run_yolo(frame):
     img = np.transpose(img, (2, 0, 1))
     img = np.expand_dims(img, axis=0)
 
-    output = sess.run(None, {yolo_input: img})[0]
-    output = np.squeeze(output)
-
-    boxes = output[:4, :]
-    scores = output[4:, :]
-
-    class_ids = np.argmax(scores, axis=0)
-    confidences = scores[class_ids, np.arange(scores.shape[1])]
+    preds = sess.run(None, {yolo_input: img})[0]
+    preds = preds[0]  # shape: (8400, 84)
 
     best = None
-    best_conf = 0
+    best_conf = 0.0
 
-    for i in range(scores.shape[1]):
-        if class_ids[i] == 0 and confidences[i] > YOLO_CONF:
-            if confidences[i] > best_conf:
-                cx, cy, bw, bh = boxes[:, i]
-                x1 = int((cx - bw / 2) * w)
-                y1 = int((cy - bh / 2) * h)
-                x2 = int((cx + bw / 2) * w)
-                y2 = int((cy + bh / 2) * h)
-                best = (x1, y1, x2, y2, confidences[i])
-                best_conf = confidences[i]
+    for det in preds:
+        cx, cy, bw, bh = det[:4]
+        scores = det[4:]
+        class_id = np.argmax(scores)
+        conf = scores[class_id]
+
+        # PERSON = class 0 in yolov8n COCO
+        if class_id != 0 or conf < YOLO_CONF:
+            continue
+
+        x1 = int((cx - bw / 2) * w)
+        y1 = int((cy - bh / 2) * h)
+        x2 = int((cx + bw / 2) * w)
+        y2 = int((cy + bh / 2) * h)
+
+        if conf > best_conf:
+            best = (x1, y1, x2, y2, conf)
+            best_conf = conf
 
     return best
 
