@@ -1,7 +1,10 @@
+#!/usr/bin/env python3
 import cv2
 import numpy as np
 import onnxruntime as ort
 import time
+import threading
+import socket
 from gpiozero import Servo, Device
 from gpiozero.pins.lgpio import LGPIOFactory
 
@@ -40,6 +43,50 @@ DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
 KEY_STEP = 0.1
+
+# ================= STREAMING =================
+STREAM_PORT = 8080
+stream_frame = None
+stream_lock = threading.Lock()
+
+def mjpeg_server():
+    global stream_frame
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("", STREAM_PORT))
+    server.listen(1)
+
+    print(f"🌐 MJPEG stream at http://<pi-ip>:{STREAM_PORT}")
+
+    conn, _ = server.accept()
+    conn.sendall(
+        b"HTTP/1.0 200 OK\r\n"
+        b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+    )
+
+    try:
+        while True:
+            with stream_lock:
+                if stream_frame is None:
+                    continue
+                frame = stream_frame.copy()
+
+            # Downscale for browser
+            frame = cv2.resize(frame, (320, 180))
+            _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+
+            conn.sendall(b"--frame\r\n")
+            conn.sendall(b"Content-Type: image/jpeg\r\n\r\n")
+            conn.sendall(jpg.tobytes())
+            conn.sendall(b"\r\n")
+
+            time.sleep(0.1)  # ~10 FPS max
+    except:
+        pass
+    finally:
+        conn.close()
+        server.close()
+
+threading.Thread(target=mjpeg_server, daemon=True).start()
 
 print("🟢 YOLO-only person tracking (ESC to quit)")
 
@@ -89,7 +136,6 @@ while True:
     cx_frame, cy_frame = w // 2, h // 2
     now = time.time()
 
-    # ---------- YOLO ----------
     if now - last_yolo_time > YOLO_INTERVAL:
         last_yolo_time = now
         result = run_yolo(frame)
@@ -97,21 +143,16 @@ while True:
             person_box = result
             last_person_time = now
 
-    # ---------- OPTION A: AUTO-RECENTER ----------
     if now - last_person_time > PERSON_TIMEOUT:
         person_box = None
-        pan = 0.0
-        tilt = 0.0
-        roll = 0.0
+        pan = tilt = roll = 0.0
 
-    # ---------- CONTROL POINT ----------
     if person_box:
         x1, y1, x2, y2, conf = person_box
         target_x = (x1 + x2) // 2
         target_y = (y1 + y2) // 2
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.circle(frame, (target_x, target_y), 6, (255, 255, 0), -1)
         cv2.putText(frame, f"PERSON {conf:.2f}",
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -119,47 +160,33 @@ while True:
     else:
         target_x, target_y = cx_frame, cy_frame
 
-    # ---------- SERVO CONTROL ----------
     error_x = target_x - cx_frame
     error_y = target_y - cy_frame
 
     if abs(error_x) > DEADZONE:
         pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
-
     if abs(error_y) > DEADZONE:
         tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
 
-    # ---------- MANUAL DEBUG ----------
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == 27:
-        break
-    elif key == ord('r'):
-        pan = tilt = roll = 0.0
-    elif key == 81:
-        pan -= KEY_STEP
-    elif key == 83:
-        pan += KEY_STEP
-    elif key == 82:
-        tilt -= KEY_STEP
-    elif key == 84:
-        tilt += KEY_STEP
-
-    # ---------- CLAMP + OUTPUT ----------
-    pan  = max(-1.0, min(1.0, pan))
+    pan = max(-1.0, min(1.0, pan))
     tilt = max(-1.0, min(1.0, tilt))
-    roll = 0.0
 
-    pan_servo.value  = pan
+    pan_servo.value = pan
     tilt_servo.value = tilt
-    roll_servo.value = roll
+    roll_servo.value = 0.0
 
-    # ---------- UI ----------
     cv2.drawMarker(frame, (cx_frame, cy_frame),
                    (255, 255, 255),
                    cv2.MARKER_CROSS, 20, 2)
 
     cv2.imshow("YOLO Person Tracker", frame)
+
+    # Update browser frame
+    with stream_lock:
+        stream_frame = frame.copy()
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
 
 cap.release()
 cv2.destroyAllWindows()
