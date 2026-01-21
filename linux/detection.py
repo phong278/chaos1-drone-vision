@@ -42,10 +42,9 @@ person_box = None
 DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
-KEY_STEP = 0.1
 
 # ================= STREAMING =================
-STREAM_PORT = 8080
+STREAM_PORT = 5000
 stream_frame = None
 stream_lock = threading.Lock()
 
@@ -70,7 +69,6 @@ def mjpeg_server():
                     continue
                 frame = stream_frame.copy()
 
-            # Downscale for browser
             frame = cv2.resize(frame, (320, 180))
             _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
 
@@ -79,7 +77,7 @@ def mjpeg_server():
             conn.sendall(jpg.tobytes())
             conn.sendall(b"\r\n")
 
-            time.sleep(0.1)  # ~10 FPS max
+            time.sleep(0.1)  # ~10 FPS
     except:
         pass
     finally:
@@ -88,7 +86,7 @@ def mjpeg_server():
 
 threading.Thread(target=mjpeg_server, daemon=True).start()
 
-print("🟢 YOLO-only person tracking (ESC to quit)")
+print("🟢 Headless YOLO person tracking running")
 
 # ================= YOLO FUNCTION =================
 def run_yolo(frame):
@@ -148,15 +146,9 @@ while True:
         pan = tilt = roll = 0.0
 
     if person_box:
-        x1, y1, x2, y2, conf = person_box
+        x1, y1, x2, y2, _ = person_box
         target_x = (x1 + x2) // 2
         target_y = (y1 + y2) // 2
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(frame, f"PERSON {conf:.2f}",
-                    (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 0, 0), 2)
     else:
         target_x, target_y = cx_frame, cy_frame
 
@@ -175,18 +167,5 @@ while True:
     tilt_servo.value = tilt
     roll_servo.value = 0.0
 
-    cv2.drawMarker(frame, (cx_frame, cy_frame),
-                   (255, 255, 255),
-                   cv2.MARKER_CROSS, 20, 2)
-
-    cv2.imshow("YOLO Person Tracker", frame)
-
-    # Update browser frame
     with stream_lock:
         stream_frame = frame.copy()
-
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
