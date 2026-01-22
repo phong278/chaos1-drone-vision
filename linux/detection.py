@@ -7,6 +7,7 @@ import threading
 import socket
 from gpiozero import Servo, Device
 from gpiozero.pins.lgpio import LGPIOFactory
+from collections import deque
 
 # ================= GPIO =================
 Device.pin_factory = LGPIOFactory()
@@ -35,24 +36,31 @@ last_yolo_time = 0
 last_person_time = 0
 person_box = None
 
+# ================= PRECISION TRACKING =================
+# Track object position history to detect movement
+position_history = deque(maxlen=10)  # Last 10 positions
+MOVEMENT_THRESHOLD = 5  # pixels - object must move this much to trigger tracking
+CENTERING_THRESHOLD = 8  # pixels - how close to center before "locked"
+LOCK_HOLD_TIME = 0.5  # seconds to wait before unlocking after centering
+
+# Tracking states
+STATE_SEARCHING = 0
+STATE_CENTERING = 1
+STATE_LOCKED = 2
+
+tracking_state = STATE_SEARCHING
+lock_time = 0
+last_target_pos = None
+
+# Adaptive gains based on state
+GAIN_CENTERING = 0.003  # Faster when centering
+GAIN_TRACKING = 0.002   # Normal tracking speed
+GAIN_LOCKED = 0.0015    # Slower, smoother when locked
+
 # ================= SERVO TUNING =================
-GAIN = 0.002
+DEADZONE = 15
 MAX_STEP = 0.03
-TRACK_ZONE  = 10     # px (movement allowed)
-CENTER_ZONE = 20     # px (lock zone)
-
-# ================= LOCK / MOTION TUNING =================
-MOTION_PIXELS = 6     # px/sec → object considered moving
-TARGET_ALPHA  = 0.7   # smoothing factor
-
-# ================= TRACKING STATE =================
-STATE_ACQUIRE = 0
-STATE_LOCKED  = 1
-STATE_TRACK   = 2
-
-track_state = STATE_ACQUIRE
-prev_target = None
-prev_time = None
+MAX_STEP_LOCKED = 0.02  # Slower max step when locked
 
 # ================= STREAMING =================
 STREAM_PORT = 5000
@@ -73,6 +81,7 @@ def mjpeg_server():
                 b"HTTP/1.0 200 OK\r\n"
                 b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
             )
+
             while True:
                 with stream_lock:
                     frame = None if stream_frame is None else stream_frame.copy()
@@ -131,6 +140,30 @@ def run_yolo(frame):
 
     return best
 
+# ================= MOVEMENT DETECTION =================
+def is_object_moving():
+    """Detect if object has moved significantly based on position history"""
+    if len(position_history) < 3:
+        return True  # Not enough data, assume moving
+    
+    # Calculate movement over last few frames
+    recent_positions = list(position_history)[-5:]
+    if len(recent_positions) < 2:
+        return True
+    
+    max_delta = 0
+    for i in range(len(recent_positions) - 1):
+        dx = recent_positions[i+1][0] - recent_positions[i][0]
+        dy = recent_positions[i+1][1] - recent_positions[i][1]
+        delta = np.sqrt(dx*dx + dy*dy)
+        max_delta = max(max_delta, delta)
+    
+    return max_delta > MOVEMENT_THRESHOLD
+
+def is_centered(error_x, error_y):
+    """Check if target is centered within threshold"""
+    return abs(error_x) < CENTERING_THRESHOLD and abs(error_y) < CENTERING_THRESHOLD
+
 # ================= MAIN LOOP =================
 while True:
     ret, frame = cap.read()
@@ -142,7 +175,7 @@ while True:
     cx_frame, cy_frame = w // 2, h // 2
     now = time.time()
 
-    # ---------- YOLO UPDATE ----------
+    # Run YOLO detection
     if now - last_yolo_time > YOLO_INTERVAL:
         last_yolo_time = now
         result = run_yolo(frame)
@@ -150,80 +183,117 @@ while True:
             person_box = result
             last_person_time = now
 
+    # Handle timeout
     if now - last_person_time > PERSON_TIMEOUT:
         person_box = None
-        track_state = STATE_ACQUIRE
-        pan = tilt = 0.0
+        pan = tilt = roll = 0.0
+        tracking_state = STATE_SEARCHING
+        position_history.clear()
 
-    # ---------- TARGET PROCESSING ----------
-    motion = 0
+    # Process tracking
+    should_move_motors = False
+    
     if person_box:
         x1, y1, x2, y2, conf = person_box
-        raw_x = (x1 + x2) // 2
-        raw_y = (y1 + y2) // 2
-
-        if prev_target is None:
-            target_x, target_y = raw_x, raw_y
-        else:
-            target_x = int(TARGET_ALPHA * prev_target[0] + (1 - TARGET_ALPHA) * raw_x)
-            target_y = int(TARGET_ALPHA * prev_target[1] + (1 - TARGET_ALPHA) * raw_y)
-
-        if prev_target and prev_time:
-            dt = now - prev_time
-            dx = target_x - prev_target[0]
-            dy = target_y - prev_target[1]
-            motion = np.hypot(dx, dy) / max(dt, 1e-3)
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(frame, f"PERSON {conf:.2f}",
+        target_x = (x1 + x2) // 2
+        target_y = (y1 + y2) // 2
+        
+        # Add to position history
+        position_history.append((target_x, target_y))
+        
+        # Calculate error
+        error_x = target_x - cx_frame
+        error_y = target_y - cy_frame
+        
+        # State machine for precision tracking
+        if tracking_state == STATE_SEARCHING:
+            # Just found object, start centering
+            tracking_state = STATE_CENTERING
+            should_move_motors = True
+            status_text = "CENTERING"
+            status_color = (0, 165, 255)  # Orange
+            
+        elif tracking_state == STATE_CENTERING:
+            # Check if centered
+            if is_centered(error_x, error_y):
+                tracking_state = STATE_LOCKED
+                lock_time = now
+                status_text = "LOCKED"
+                status_color = (0, 255, 0)  # Green
+            else:
+                should_move_motors = True
+                status_text = "CENTERING"
+                status_color = (0, 165, 255)
+                
+        elif tracking_state == STATE_LOCKED:
+            # Check if object is moving
+            if is_object_moving():
+                should_move_motors = True
+                status_text = "LOCKED - TRACKING"
+                status_color = (0, 255, 255)  # Yellow
+            else:
+                # Object stationary, check if still centered
+                if not is_centered(error_x, error_y):
+                    # Drifted off center, recenter
+                    should_move_motors = True
+                    status_text = "LOCKED - ADJUSTING"
+                    status_color = (0, 255, 255)
+                else:
+                    should_move_motors = False
+                    status_text = "LOCKED - STEADY"
+                    status_color = (0, 255, 0)
+        
+        # Draw detection box and status
+        cv2.rectangle(frame, (x1, y1), (x2, y2), status_color, 2)
+        cv2.putText(frame, f"{status_text} {conf:.2f}",
                     (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+        
+        # Draw center crosshair
+        cv2.circle(frame, (target_x, target_y), 5, status_color, -1)
+        
+        # Draw centering zone
+        cv2.rectangle(frame, 
+                     (cx_frame - CENTERING_THRESHOLD, cy_frame - CENTERING_THRESHOLD),
+                     (cx_frame + CENTERING_THRESHOLD, cy_frame + CENTERING_THRESHOLD),
+                     (0, 255, 0), 1)
+        
     else:
         target_x, target_y = cx_frame, cy_frame
+        error_x = error_y = 0
+        tracking_state = STATE_SEARCHING
 
-    # ---------- ERROR ----------
-    error_x = target_x - cx_frame
-    error_y = target_y - cy_frame
-
-    # ---------- STATE MACHINE ----------
-    if track_state == STATE_ACQUIRE:
-        if abs(error_x) < CENTER_ZONE and abs(error_y) < CENTER_ZONE:
-            track_state = STATE_LOCKED
-
-    elif track_state == STATE_LOCKED:
-        if motion > MOTION_PIXELS:
-            track_state = STATE_TRACK
-
-    elif track_state == STATE_TRACK:
-        if (abs(error_x) < CENTER_ZONE and
-            abs(error_y) < CENTER_ZONE and
-            motion < MOTION_PIXELS):
-            track_state = STATE_LOCKED
-
-    # ---------- SERVO CONTROL ----------
-    if track_state in (STATE_ACQUIRE, STATE_TRACK):
-        if abs(error_x) > TRACK_ZONE:
-            pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
-        if abs(error_y) > TRACK_ZONE:
-            tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
-
+    # Update servo positions based on state
+    if should_move_motors:
+        # Select gain and max step based on state
+        if tracking_state == STATE_CENTERING:
+            gain = GAIN_CENTERING
+            max_step = MAX_STEP
+        elif tracking_state == STATE_LOCKED:
+            gain = GAIN_LOCKED
+            max_step = MAX_STEP_LOCKED
+        else:
+            gain = GAIN_TRACKING
+            max_step = MAX_STEP
+        
+        # Apply movements with deadzone
+        if abs(error_x) > DEADZONE:
+            pan += max(-max_step, min(max_step, error_x * gain))
+        if abs(error_y) > DEADZONE:
+            tilt += max(-max_step, min(max_step, error_y * gain))
+    
+    # Clamp servo values
     pan = max(-1.0, min(1.0, pan))
     tilt = max(-1.0, min(1.0, tilt))
 
+    # Update servos
     pan_servo.value = pan
     tilt_servo.value = tilt
     roll_servo.value = 0.0
 
-    # ---------- DEBUG OVERLAY ----------
-    state_txt = ["ACQUIRE", "LOCKED", "TRACK"][track_state]
-    cv2.putText(frame, f"STATE: {state_txt}", (10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    cv2.putText(frame, f"MOTION: {motion:.1f}", (10, 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    # Draw center crosshair for frame
+    cv2.line(frame, (cx_frame - 10, cy_frame), (cx_frame + 10, cy_frame), (255, 255, 255), 1)
+    cv2.line(frame, (cx_frame, cy_frame - 10), (cx_frame, cy_frame + 10), (255, 255, 255), 1)
 
-    # ---------- STREAM ----------
     with stream_lock:
         stream_frame = frame.copy()
-
-    prev_target = (target_x, target_y)
-    prev_time = now
