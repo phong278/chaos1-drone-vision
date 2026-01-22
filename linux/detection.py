@@ -52,10 +52,18 @@ tracking_state = STATE_SEARCHING
 lock_time = 0
 last_target_pos = None
 
+# PD control variables
+previous_error_x = 0
+previous_error_y = 0
+previous_time = time.time()
+
 # Adaptive gains based on state
-GAIN_CENTERING = 0.003  # Faster when centering
-GAIN_TRACKING = 0.002   # Normal tracking speed
-GAIN_LOCKED = 0.0008    # Much slower, smoother when locked
+GAIN_CENTERING = 0.003  # Faster when centering (P gain)
+GAIN_TRACKING = 0.002   # Normal tracking speed (P gain)
+GAIN_LOCKED = 0.0008    # Much slower, smoother when locked (P gain)
+
+# Derivative gain for damping (reduces overshoot)
+GAIN_D = 0.015  # Dampens rapid movements
 
 # ================= SERVO TUNING =================
 DEADZONE = 25  # Larger deadzone = less micro-movements
@@ -276,11 +284,32 @@ while True:
             gain = GAIN_TRACKING
             max_step = MAX_STEP
         
-        # Apply movements with deadzone
+        # Calculate time delta for derivative
+        current_time = time.time()
+        dt = current_time - previous_time
+        if dt > 0:
+            # Derivative term (rate of change of error)
+            derivative_x = (error_x - previous_error_x) / dt
+            derivative_y = (error_y - previous_error_y) / dt
+        else:
+            derivative_x = derivative_y = 0
+        
+        previous_error_x = error_x
+        previous_error_y = error_y
+        previous_time = current_time
+        
+        # PD control: P + D
+        # P term: proportional to current error
+        # D term: opposes rapid changes (damping)
         if abs(error_x) > DEADZONE:
-            pan += max(-max_step, min(max_step, error_x * gain))
+            p_term = error_x * gain
+            d_term = -derivative_x * GAIN_D  # Negative to dampen
+            pan += max(-max_step, min(max_step, p_term + d_term))
+        
         if abs(error_y) > DEADZONE:
-            tilt += max(-max_step, min(max_step, error_y * gain))
+            p_term = error_y * gain
+            d_term = -derivative_y * GAIN_D
+            tilt += max(-max_step, min(max_step, p_term + d_term))
     
     # Clamp servo values
     pan = max(-1.0, min(1.0, pan))
