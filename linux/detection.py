@@ -1,7 +1,10 @@
+#!/usr/bin/env python3
 import cv2
 import numpy as np
 import onnxruntime as ort
 import time
+import threading
+import socket
 from gpiozero import Servo, Device
 from gpiozero.pins.lgpio import LGPIOFactory
 
@@ -25,10 +28,7 @@ YOLO_CONF = 0.4
 YOLO_INTERVAL = 0.1
 PERSON_TIMEOUT = 1.0
 
-sess = ort.InferenceSession(
-    MODEL_PATH,
-    providers=["CPUExecutionProvider"]
-)
+sess = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
 yolo_input = sess.get_inputs()[0].name
 
 last_yolo_time = 0
@@ -39,11 +39,51 @@ person_box = None
 DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
-KEY_STEP = 0.1
 
-print("🟢 YOLO-only person tracking (ESC to quit)")
+# ================= STREAMING =================
+STREAM_PORT = 5000
+stream_frame = None
+stream_lock = threading.Lock()
 
-# ================= YOLO FUNCTION =================
+def mjpeg_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("", STREAM_PORT))
+    server.listen(1)
+    print(f"🌐 Stream: http://<pi-ip>:{STREAM_PORT}")
+
+    while True:
+        conn, _ = server.accept()
+        try:
+            conn.sendall(
+                b"HTTP/1.0 200 OK\r\n"
+                b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+            )
+
+            while True:
+                with stream_lock:
+                    frame = None if stream_frame is None else stream_frame.copy()
+
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
+
+                ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                if not ok:
+                    continue
+
+                conn.sendall(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                conn.sendall(jpg.tobytes())
+                conn.sendall(b"\r\n")
+                time.sleep(0.1)
+        except:
+            pass
+        finally:
+            conn.close()
+
+threading.Thread(target=mjpeg_server, daemon=True).start()
+
+# ================= YOLO FUNCTION (WORKING ONE) =================
 def run_yolo(frame):
     h, w, _ = frame.shape
 
@@ -63,7 +103,7 @@ def run_yolo(frame):
     confidences = scores[class_ids, np.arange(scores.shape[1])]
 
     best = None
-    best_conf = 0
+    best_conf = 0.0
 
     for i in range(scores.shape[1]):
         if class_ids[i] == 0 and confidences[i] > YOLO_CONF:
@@ -89,7 +129,6 @@ while True:
     cx_frame, cy_frame = w // 2, h // 2
     now = time.time()
 
-    # ---------- YOLO ----------
     if now - last_yolo_time > YOLO_INTERVAL:
         last_yolo_time = now
         result = run_yolo(frame)
@@ -97,69 +136,37 @@ while True:
             person_box = result
             last_person_time = now
 
-    # ---------- OPTION A: AUTO-RECENTER ----------
     if now - last_person_time > PERSON_TIMEOUT:
         person_box = None
-        pan = 0.0
-        tilt = 0.0
-        roll = 0.0
+        pan = tilt = roll = 0.0
 
-    # ---------- CONTROL POINT ----------
     if person_box:
         x1, y1, x2, y2, conf = person_box
         target_x = (x1 + x2) // 2
         target_y = (y1 + y2) // 2
 
+        # ✅ DRAW FOR STREAM
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.circle(frame, (target_x, target_y), 6, (255, 255, 0), -1)
         cv2.putText(frame, f"PERSON {conf:.2f}",
                     (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 0, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
     else:
         target_x, target_y = cx_frame, cy_frame
 
-    # ---------- SERVO CONTROL ----------
     error_x = target_x - cx_frame
     error_y = target_y - cy_frame
 
     if abs(error_x) > DEADZONE:
         pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
-
     if abs(error_y) > DEADZONE:
         tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
 
-    # ---------- MANUAL DEBUG ----------
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == 27:
-        break
-    elif key == ord('r'):
-        pan = tilt = roll = 0.0
-    elif key == 81:
-        pan -= KEY_STEP
-    elif key == 83:
-        pan += KEY_STEP
-    elif key == 82:
-        tilt -= KEY_STEP
-    elif key == 84:
-        tilt += KEY_STEP
-
-    # ---------- CLAMP + OUTPUT ----------
-    pan  = max(-1.0, min(1.0, pan))
+    pan = max(-1.0, min(1.0, pan))
     tilt = max(-1.0, min(1.0, tilt))
-    roll = 0.0
 
-    pan_servo.value  = pan
+    pan_servo.value = pan
     tilt_servo.value = tilt
-    roll_servo.value = roll
+    roll_servo.value = 0.0
 
-    # ---------- UI ----------
-    cv2.drawMarker(frame, (cx_frame, cy_frame),
-                   (255, 255, 255),
-                   cv2.MARKER_CROSS, 20, 2)
-
-    cv2.imshow("YOLO Person Tracker", frame)
-
-cap.release()
-cv2.destroyAllWindows()
+    with stream_lock:
+        stream_frame = frame.copy()
