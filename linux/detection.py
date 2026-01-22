@@ -25,7 +25,7 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
 # ================= YOLOv8 ONNX =================
 MODEL_PATH = "yolov8n.onnx"
-YOLO_CONF = 0.4
+YOLO_CONF = 0.3
 YOLO_INTERVAL = 0.1
 PERSON_TIMEOUT = 1.0
 
