@@ -36,9 +36,23 @@ last_person_time = 0
 person_box = None
 
 # ================= SERVO TUNING =================
-DEADZONE = 15
 GAIN = 0.002
 MAX_STEP = 0.03
+TRACK_ZONE  = 10     # px (movement allowed)
+CENTER_ZONE = 20     # px (lock zone)
+
+# ================= LOCK / MOTION TUNING =================
+MOTION_PIXELS = 6     # px/sec → object considered moving
+TARGET_ALPHA  = 0.7   # smoothing factor
+
+# ================= TRACKING STATE =================
+STATE_ACQUIRE = 0
+STATE_LOCKED  = 1
+STATE_TRACK   = 2
+
+track_state = STATE_ACQUIRE
+prev_target = None
+prev_time = None
 
 # ================= STREAMING =================
 STREAM_PORT = 5000
@@ -59,7 +73,6 @@ def mjpeg_server():
                 b"HTTP/1.0 200 OK\r\n"
                 b"Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
             )
-
             while True:
                 with stream_lock:
                     frame = None if stream_frame is None else stream_frame.copy()
@@ -83,7 +96,7 @@ def mjpeg_server():
 
 threading.Thread(target=mjpeg_server, daemon=True).start()
 
-# ================= YOLO FUNCTION (WORKING ONE) =================
+# ================= YOLO FUNCTION =================
 def run_yolo(frame):
     h, w, _ = frame.shape
 
@@ -129,6 +142,7 @@ while True:
     cx_frame, cy_frame = w // 2, h // 2
     now = time.time()
 
+    # ---------- YOLO UPDATE ----------
     if now - last_yolo_time > YOLO_INTERVAL:
         last_yolo_time = now
         result = run_yolo(frame)
@@ -138,14 +152,28 @@ while True:
 
     if now - last_person_time > PERSON_TIMEOUT:
         person_box = None
-        pan = tilt = roll = 0.0
+        track_state = STATE_ACQUIRE
+        pan = tilt = 0.0
 
+    # ---------- TARGET PROCESSING ----------
+    motion = 0
     if person_box:
         x1, y1, x2, y2, conf = person_box
-        target_x = (x1 + x2) // 2
-        target_y = (y1 + y2) // 2
+        raw_x = (x1 + x2) // 2
+        raw_y = (y1 + y2) // 2
 
-        # ✅ DRAW FOR STREAM
+        if prev_target is None:
+            target_x, target_y = raw_x, raw_y
+        else:
+            target_x = int(TARGET_ALPHA * prev_target[0] + (1 - TARGET_ALPHA) * raw_x)
+            target_y = int(TARGET_ALPHA * prev_target[1] + (1 - TARGET_ALPHA) * raw_y)
+
+        if prev_target and prev_time:
+            dt = now - prev_time
+            dx = target_x - prev_target[0]
+            dy = target_y - prev_target[1]
+            motion = np.hypot(dx, dy) / max(dt, 1e-3)
+
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
         cv2.putText(frame, f"PERSON {conf:.2f}",
                     (x1, y1 - 10),
@@ -153,13 +181,31 @@ while True:
     else:
         target_x, target_y = cx_frame, cy_frame
 
+    # ---------- ERROR ----------
     error_x = target_x - cx_frame
     error_y = target_y - cy_frame
 
-    if abs(error_x) > DEADZONE:
-        pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
-    if abs(error_y) > DEADZONE:
-        tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
+    # ---------- STATE MACHINE ----------
+    if track_state == STATE_ACQUIRE:
+        if abs(error_x) < CENTER_ZONE and abs(error_y) < CENTER_ZONE:
+            track_state = STATE_LOCKED
+
+    elif track_state == STATE_LOCKED:
+        if motion > MOTION_PIXELS:
+            track_state = STATE_TRACK
+
+    elif track_state == STATE_TRACK:
+        if (abs(error_x) < CENTER_ZONE and
+            abs(error_y) < CENTER_ZONE and
+            motion < MOTION_PIXELS):
+            track_state = STATE_LOCKED
+
+    # ---------- SERVO CONTROL ----------
+    if track_state in (STATE_ACQUIRE, STATE_TRACK):
+        if abs(error_x) > TRACK_ZONE:
+            pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
+        if abs(error_y) > TRACK_ZONE:
+            tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
 
     pan = max(-1.0, min(1.0, pan))
     tilt = max(-1.0, min(1.0, tilt))
@@ -168,5 +214,16 @@ while True:
     tilt_servo.value = tilt
     roll_servo.value = 0.0
 
+    # ---------- DEBUG OVERLAY ----------
+    state_txt = ["ACQUIRE", "LOCKED", "TRACK"][track_state]
+    cv2.putText(frame, f"STATE: {state_txt}", (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(frame, f"MOTION: {motion:.1f}", (10, 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    # ---------- STREAM ----------
     with stream_lock:
         stream_frame = frame.copy()
+
+    prev_target = (target_x, target_y)
+    prev_time = now
