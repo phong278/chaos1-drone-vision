@@ -39,8 +39,8 @@ person_box = None
 # ================= PRECISION TRACKING =================
 # Track object position history to detect movement
 position_history = deque(maxlen=15)  # Last 15 positions for better smoothing
-MOVEMENT_THRESHOLD = 10  # pixels - object must move this much to trigger tracking
-CENTERING_THRESHOLD = 20  # pixels - how close to center before "locked"
+MOVEMENT_THRESHOLD = 15  # pixels - object must move this much to trigger tracking
+CENTERING_THRESHOLD = 25  # pixels - how close to center before "locked"
 LOCK_HOLD_TIME = 0.5  # seconds to wait before unlocking after centering
 
 # Tracking states
@@ -66,7 +66,7 @@ GAIN_LOCKED = 0.0008    # Much slower, smoother when locked (P gain)
 GAIN_D = 0.005  # Dampens rapid movements (REDUCED - was causing oscillation)
 
 # ================= SERVO TUNING =================
-DEADZONE = 25  # Larger deadzone = less micro-movements
+DEADZONE = 30  # Larger deadzone = less micro-movements
 MAX_STEP = 0.03
 MAX_STEP_LOCKED = 0.015  # Slower max step when locked
 
