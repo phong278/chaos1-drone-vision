@@ -63,7 +63,7 @@ GAIN_TRACKING = 0.002   # Normal tracking speed (P gain)
 GAIN_LOCKED = 0.0008    # Much slower, smoother when locked (P gain)
 
 # Derivative gain for damping (reduces overshoot)
-GAIN_D = 0.015  # Dampens rapid movements
+GAIN_D = 0.005  # Dampens rapid movements (REDUCED - was causing oscillation)
 
 # ================= SERVO TUNING =================
 DEADZONE = 25  # Larger deadzone = less micro-movements
@@ -287,10 +287,14 @@ while True:
         # Calculate time delta for derivative
         current_time = time.time()
         dt = current_time - previous_time
-        if dt > 0:
+        if dt > 0 and dt < 0.5:  # Ignore large time gaps
             # Derivative term (rate of change of error)
             derivative_x = (error_x - previous_error_x) / dt
             derivative_y = (error_y - previous_error_y) / dt
+            
+            # Limit derivative to prevent spikes from detection jitter
+            derivative_x = max(-100, min(100, derivative_x))
+            derivative_y = max(-100, min(100, derivative_y))
         else:
             derivative_x = derivative_y = 0
         
