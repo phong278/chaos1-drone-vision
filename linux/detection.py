@@ -70,6 +70,22 @@ DEADZONE = 25  # Larger deadzone = less micro-movements
 MAX_STEP = 0.03
 MAX_STEP_LOCKED = 0.015  # Slower max step when locked
 
+# ================ IP =================
+def get_local_ip():
+    """
+    Returns the local LAN IP of the Raspberry Pi.
+    Works without internet access.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't need to be reachable
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
 # ================= STREAMING =================
 STREAM_PORT = 5000
 stream_frame = None
@@ -80,7 +96,9 @@ def mjpeg_server():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("", STREAM_PORT))
     server.listen(1)
-    print(f"🌐 Stream: http://<pi-ip>:{STREAM_PORT}")
+    ip = get_local_ip()
+    print(f"🌐 Stream available at: http://{ip}:{STREAM_PORT}")
+
 
     while True:
         conn, _ = server.accept()
