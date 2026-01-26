@@ -35,6 +35,7 @@ yolo_input = sess.get_inputs()[0].name
 last_yolo_time = 0
 last_person_time = 0
 person_box = None
+RESET_KEY = ord('r')
 
 # ================= PRECISION TRACKING =================
 # Track object position history to detect movement
@@ -348,3 +349,22 @@ while True:
 
     with stream_lock:
         stream_frame = frame.copy()
+            # ---------- KEY HANDLING ----------
+        key = cv2.waitKey(1) & 0xFF
+        if key == RESET_KEY:
+            print("🔄 Resetting servos to home position")
+
+            # Reset servo positions
+            pan = tilt = roll = 0.0
+            pan_servo.value = 0.0
+            tilt_servo.value = 0.0
+            roll_servo.value = 0.0
+
+            # Reset tracking state (important)
+            tracking_state = STATE_SEARCHING
+            position_history.clear()
+
+            # Reset PD controller memory
+            previous_error_x = 0
+            previous_error_y = 0
+            previous_time = time.time()
