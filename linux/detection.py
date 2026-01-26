@@ -7,6 +7,7 @@ import threading
 import socket
 from gpiozero import Servo, Device
 from gpiozero.pins.lgpio import LGPIOFactory
+from collections import deque
 
 # ================= GPIO =================
 Device.pin_factory = LGPIOFactory()
@@ -24,7 +25,7 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
 # ================= YOLOv8 ONNX =================
 MODEL_PATH = "yolov8n.onnx"
-YOLO_CONF = 0.4
+YOLO_CONF = 0.3
 YOLO_INTERVAL = 0.1
 PERSON_TIMEOUT = 1.0
 
@@ -34,12 +35,58 @@ yolo_input = sess.get_inputs()[0].name
 last_yolo_time = 0
 last_person_time = 0
 person_box = None
+RESET_KEY = ord('r')
+
+# ================= PRECISION TRACKING =================
+# Track object position history to detect movement
+position_history = deque(maxlen=15)  # Last 15 positions for better smoothing
+MOVEMENT_THRESHOLD = 10  # pixels - object must move this much to trigger tracking
+CENTERING_THRESHOLD = 20  # pixels - how close to center before "locked"
+LOCK_HOLD_TIME = 0.5  # seconds to wait before unlocking after centering
+
+# Tracking states
+STATE_SEARCHING = 0
+STATE_CENTERING = 1
+STATE_LOCKED = 2
+
+tracking_state = STATE_SEARCHING
+lock_time = 0
+last_target_pos = None
+
+# PD control variables
+previous_error_x = 0
+previous_error_y = 0
+previous_time = time.time()
+
+# Adaptive gains based on state
+GAIN_CENTERING = 0.003  # Faster when centering (P gain)
+GAIN_TRACKING = 0.002   # Normal tracking speed (P gain)
+GAIN_LOCKED = 0.0008    # Much slower, smoother when locked (P gain)
+
+# Derivative gain for damping (reduces overshoot)
+GAIN_D = 0.005  # Dampens rapid movements (REDUCED - was causing oscillation)
 
 # ================= SERVO TUNING =================
-DEADZONE = 15
-GAIN = 0.002
+DEADZONE = 25  # Larger deadzone = less micro-movements
 MAX_STEP = 0.03
+MAX_STEP_LOCKED = 0.015  # Slower max step when locked
 
+# ================ IP =================
+def get_local_ip():
+    """
+    Returns the local LAN IP of the Raspberry Pi.
+    Works without internet access.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't need to be reachable
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
 # ================= STREAMING =================
 STREAM_PORT = 5000
 stream_frame = None
@@ -50,7 +97,9 @@ def mjpeg_server():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("", STREAM_PORT))
     server.listen(1)
-    print(f"🌐 Stream: http://<pi-ip>:{STREAM_PORT}")
+    ip = get_local_ip()
+    print(f"🌐 Stream available at: http://{ip}:{STREAM_PORT}")
+
 
     while True:
         conn, _ = server.accept()
@@ -83,7 +132,7 @@ def mjpeg_server():
 
 threading.Thread(target=mjpeg_server, daemon=True).start()
 
-# ================= YOLO FUNCTION (WORKING ONE) =================
+# ================= YOLO FUNCTION =================
 def run_yolo(frame):
     h, w, _ = frame.shape
 
@@ -118,6 +167,30 @@ def run_yolo(frame):
 
     return best
 
+# ================= MOVEMENT DETECTION =================
+def is_object_moving():
+    """Detect if object has moved significantly based on position history"""
+    if len(position_history) < 3:
+        return True  # Not enough data, assume moving
+    
+    # Calculate movement over last few frames
+    recent_positions = list(position_history)[-5:]
+    if len(recent_positions) < 2:
+        return True
+    
+    max_delta = 0
+    for i in range(len(recent_positions) - 1):
+        dx = recent_positions[i+1][0] - recent_positions[i][0]
+        dy = recent_positions[i+1][1] - recent_positions[i][1]
+        delta = np.sqrt(dx*dx + dy*dy)
+        max_delta = max(max_delta, delta)
+    
+    return max_delta > MOVEMENT_THRESHOLD
+
+def is_centered(error_x, error_y):
+    """Check if target is centered within threshold"""
+    return abs(error_x) < CENTERING_THRESHOLD and abs(error_y) < CENTERING_THRESHOLD
+
 # ================= MAIN LOOP =================
 while True:
     ret, frame = cap.read()
@@ -129,6 +202,7 @@ while True:
     cx_frame, cy_frame = w // 2, h // 2
     now = time.time()
 
+    # Run YOLO detection
     if now - last_yolo_time > YOLO_INTERVAL:
         last_yolo_time = now
         result = run_yolo(frame)
@@ -136,37 +210,161 @@ while True:
             person_box = result
             last_person_time = now
 
+    # Handle timeout
     if now - last_person_time > PERSON_TIMEOUT:
         person_box = None
         pan = tilt = roll = 0.0
+        tracking_state = STATE_SEARCHING
+        position_history.clear()
 
+    # Process tracking
+    should_move_motors = False
+    
     if person_box:
         x1, y1, x2, y2, conf = person_box
         target_x = (x1 + x2) // 2
         target_y = (y1 + y2) // 2
-
-        # ✅ DRAW FOR STREAM
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(frame, f"PERSON {conf:.2f}",
+        
+        # Add to position history
+        position_history.append((target_x, target_y))
+        
+        # Calculate error
+        error_x = target_x - cx_frame
+        error_y = target_y - cy_frame
+        
+        # State machine for precision tracking
+        if tracking_state == STATE_SEARCHING:
+            # Just found object, start centering
+            tracking_state = STATE_CENTERING
+            should_move_motors = True
+            status_text = "CENTERING"
+            status_color = (0, 165, 255)  # Orange
+            
+        elif tracking_state == STATE_CENTERING:
+            # Check if centered
+            if is_centered(error_x, error_y):
+                tracking_state = STATE_LOCKED
+                lock_time = now
+                status_text = "LOCKED"
+                status_color = (0, 255, 0)  # Green
+            else:
+                should_move_motors = True
+                status_text = "CENTERING"
+                status_color = (0, 165, 255)
+                
+        elif tracking_state == STATE_LOCKED:
+            # Check if object is moving
+            if is_object_moving():
+                should_move_motors = True
+                status_text = "LOCKED - TRACKING"
+                status_color = (0, 255, 255)  # Yellow
+            else:
+                # Object stationary, check if still centered
+                if not is_centered(error_x, error_y):
+                    # Drifted off center, recenter
+                    should_move_motors = True
+                    status_text = "LOCKED - ADJUSTING"
+                    status_color = (0, 255, 255)
+                else:
+                    should_move_motors = False
+                    status_text = "LOCKED - STEADY"
+                    status_color = (0, 255, 0)
+        
+        # Draw detection box and status
+        cv2.rectangle(frame, (x1, y1), (x2, y2), status_color, 2)
+        cv2.putText(frame, f"{status_text} {conf:.2f}",
                     (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+        
+        # Draw center crosshair
+        cv2.circle(frame, (target_x, target_y), 5, status_color, -1)
+        
+        # Draw centering zone
+        cv2.rectangle(frame, 
+                     (cx_frame - CENTERING_THRESHOLD, cy_frame - CENTERING_THRESHOLD),
+                     (cx_frame + CENTERING_THRESHOLD, cy_frame + CENTERING_THRESHOLD),
+                     (0, 255, 0), 1)
+        
     else:
         target_x, target_y = cx_frame, cy_frame
+        error_x = error_y = 0
+        tracking_state = STATE_SEARCHING
 
-    error_x = target_x - cx_frame
-    error_y = target_y - cy_frame
-
-    if abs(error_x) > DEADZONE:
-        pan += max(-MAX_STEP, min(MAX_STEP, error_x * GAIN))
-    if abs(error_y) > DEADZONE:
-        tilt += max(-MAX_STEP, min(MAX_STEP, error_y * GAIN))
-
+    # Update servo positions based on state
+    if should_move_motors:
+        # Select gain and max step based on state
+        if tracking_state == STATE_CENTERING:
+            gain = GAIN_CENTERING
+            max_step = MAX_STEP
+        elif tracking_state == STATE_LOCKED:
+            gain = GAIN_LOCKED
+            max_step = MAX_STEP_LOCKED
+        else:
+            gain = GAIN_TRACKING
+            max_step = MAX_STEP
+        
+        # Calculate time delta for derivative
+        current_time = time.time()
+        dt = current_time - previous_time
+        if dt > 0 and dt < 0.5:  # Ignore large time gaps
+            # Derivative term (rate of change of error)
+            derivative_x = (error_x - previous_error_x) / dt
+            derivative_y = (error_y - previous_error_y) / dt
+            
+            # Limit derivative to prevent spikes from detection jitter
+            derivative_x = max(-100, min(100, derivative_x))
+            derivative_y = max(-100, min(100, derivative_y))
+        else:
+            derivative_x = derivative_y = 0
+        
+        previous_error_x = error_x
+        previous_error_y = error_y
+        previous_time = current_time
+        
+        # PD control: P + D
+        # P term: proportional to current error
+        # D term: opposes rapid changes (damping)
+        if abs(error_x) > DEADZONE:
+            p_term = error_x * gain
+            d_term = -derivative_x * GAIN_D  # Negative to dampen
+            pan += max(-max_step, min(max_step, p_term + d_term))
+        
+        if abs(error_y) > DEADZONE:
+            p_term = error_y * gain
+            d_term = -derivative_y * GAIN_D
+            tilt += max(-max_step, min(max_step, p_term + d_term))
+    
+    # Clamp servo values
     pan = max(-1.0, min(1.0, pan))
     tilt = max(-1.0, min(1.0, tilt))
 
+    # Update servos
     pan_servo.value = pan
     tilt_servo.value = tilt
     roll_servo.value = 0.0
 
+    # Draw center crosshair for frame
+    cv2.line(frame, (cx_frame - 10, cy_frame), (cx_frame + 10, cy_frame), (255, 255, 255), 1)
+    cv2.line(frame, (cx_frame, cy_frame - 10), (cx_frame, cy_frame + 10), (255, 255, 255), 1)
+
     with stream_lock:
         stream_frame = frame.copy()
+            # ---------- KEY HANDLING ----------
+        key = cv2.waitKey(1) & 0xFF
+        if key == RESET_KEY:
+            print("🔄 Resetting servos to home position")
+
+            # Reset servo positions
+            pan = tilt = roll = 0.0
+            pan_servo.value = 0.0
+            tilt_servo.value = 0.0
+            roll_servo.value = 0.0
+
+            # Reset tracking state (important)
+            tracking_state = STATE_SEARCHING
+            position_history.clear()
+
+            # Reset PD controller memory
+            previous_error_x = 0
+            previous_error_y = 0
+            previous_time = time.time()
