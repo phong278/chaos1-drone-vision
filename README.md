@@ -1,24 +1,85 @@
-# Multi-Object Detection & Streaming System for Raspberry Pi 5
+# Multi-Object Detection, Tracking & Servo Control System for Raspberry Pi 5
 
-A real-time object detection and MJPEG streaming system optimized for Raspberry Pi 5, using a custom-trained YOLOv8 model deployed via OpenVINO for efficient edge inference.
+A real-time **vision-based detection, tracking, servo control, and MJPEG streaming system** designed for Raspberry Pi 5. The system uses a YOLOv8 ONNX model with CPU inference and precision motion control logic to physically track detected targets using pan/tilt servos.
 
-Designed for defense, surveillance, robotics, and drone-based monitoring applications.
+Designed for **surveillance, robotics, autonomous platforms, and research prototypes** where lightweight, low-latency, on-device inference is required.
+
+---
 
 ## Overview
 
-This system performs real-time detection on live camera input, overlays detections, and streams the processed video over the network using a lightweight MJPEG HTTP server.
+This system performs real-time object detection on a live camera feed, tracks a selected target with a **state-based precision controller**, and streams annotated video over the network using a **native MJPEG HTTP server**.
 
-Key goals:
+Key capabilities:
 
-- Run efficiently on Raspberry Pi 5
+* Real-time YOLOv8 object detection (ONNX Runtime)
+* Precision pan/tilt servo tracking (vision-only, no IMU)
+* Motion-aware target locking (no jitter when target is stationary)
+* PD-controlled servo movement with adaptive gains
+* Lightweight MJPEG streaming over HTTP
+* Designed and tuned for Raspberry Pi 5
 
-- Use custom military dataset
+---
 
-- Support OpenVINO inference
+## System Architecture
 
-- Minimal latency, minimal dependencies
+**Pipeline:**
 
-- Network-accessible live stream
+Camera → YOLOv8 ONNX Inference → Target Selection →
+Tracking State Machine → PD Servo Controller →
+MJPEG Stream Output
+
+The system is intentionally single-process and CPU-only to ensure deterministic timing and stability on embedded hardware.
+
+---
+
+## Tracking Logic
+
+The tracker operates as a **state machine** to improve mechanical precision and stability:
+
+### Tracking States
+
+* **SEARCHING** – No valid target detected
+* **CENTERING** – Target detected, servos actively center
+* **LOCKED** – Target centered and stationary (servos frozen)
+
+### Motion Awareness
+
+* Target motion is estimated using recent image-space position history
+* Servos only move when:
+
+  * The target drifts off-center, or
+  * The target begins moving again
+
+This prevents micro-oscillation caused by detector noise.
+
+---
+
+## Servo Control
+
+* Hardware controlled using `gpiozero` + `lgpio`
+* Vision-only PD controller (Proportional + Derivative)
+* Adaptive gains depending on tracking state
+
+---
+
+## Streaming
+
+* Native MJPEG server
+* Streams annotated frames over HTTP
+* Accessible from any browser on the local network
+
+Example:
+
+`http://192.168.1.42:5000`
+
+Designed for:
+
+* Low latency
+* Minimal CPU overhead
+* Easy integration with dashboards or monitoring systems
+
+---
 
 ## Dataset & Classes
 
@@ -47,66 +108,35 @@ names:
 
 ### Dataset Composition
 
-The dataset is built on KIIT-MILA, which serves as the base dataset and provides the majority of ground combat classes and imagery.
-Additional datasets were incorporated to extend the class set and improve coverage of aerial and maritime targets.
+The dataset is built on **KIIT-MILA** as the primary source of ground-based military targets, with additional datasets incorporated to expand aerial and maritime coverage.
 
-Base Dataset
+**Base Dataset**
 
-- KIIT-MILA (Military Imagery for Target Detection)
-`https://www.kaggle.com/datasets/sudipchakrabarty/kiit-mita`
+* KIIT-MILA (Military Imagery for Target Detection)
+  [https://www.kaggle.com/datasets/sudipchakrabarty/kiit-mita](https://www.kaggle.com/datasets/sudipchakrabarty/kiit-mita)
 
-Used as the foundational dataset for land-based military targets such as tanks, vehicles, artillery, radar, and personnel.
+Used for tanks, vehicles, artillery, radar systems, and personnel.
 
-Extended Datasets
+**Extended Datasets**
 
-- Military Aircraft Detection Dataset
-`https://www.kaggle.com/datasets/a2015003713/militaryaircraftdetectiondataset`
+* Military Aircraft Detection Dataset
+  [https://www.kaggle.com/datasets/a2015003713/militaryaircraftdetectiondataset](https://www.kaggle.com/datasets/a2015003713/militaryaircraftdetectiondataset)
 
-Used to introduce the Aircraft class.
+* Ships in Aerial Images Dataset
+  [https://www.kaggle.com/datasets/siddharthkumarsah/ships-in-aerial-images](https://www.kaggle.com/datasets/siddharthkumarsah/ships-in-aerial-images)
 
-- Ships in Aerial Images Dataset
-`https://www.kaggle.com/datasets/siddharthkumarsah/ships-in-aerial-images`
+All datasets were converted to YOLO format, unified under a single class mapping, and merged into a balanced train/validation/test split.
 
-Used to introduce the Ships class, with controlled subsampling to avoid class imbalance.
+---
 
-**All datasets were converted to YOLO format, unified under a consistent class ID mapping, and merged into a single train/validation/test split.**
+## Runtime Characteristics
 
-## Software Requirements
+* CPU-only inference (no GPU / NPU required)
+* Tuned for real-time performance at low resolutions
+* Stable servo behavior even under noisy detections
+* Designed for continuous unattended operation
 
-- Raspberry Pi OS 64-bit
-
-- Python 3.9+
-
-- OpenVINO Runtime
-
-- OpenCV with V4L2 support
-
-## Configuration
-
-Default Runtime Configuration (in code)
-
-```python
-config = {
-    'system': {
-        'enable_streaming': True,
-        'streaming_port': 5000
-    },
-    'performance': {
-        'throttle_fps': 15,
-        'frame_skip': 2,
-        'inference_size': 320
-    },
-    'camera': {
-        'device_id': 0,
-        'width': 1280,
-        'height': 720,
-        'fps': 15
-    },
-    'detection': {
-        'confidence': 0.4
-    }
-}
-```
+---
 
 ## License & Intellectual Property
 
@@ -121,11 +151,8 @@ This software and associated documentation files (the "Software") are proprietar
 **Restrictions:**
 
 ❌ No public distribution or sharing
-
 ❌ No commercial use without explicit written permission
-
 ❌ No modification or derivative works
-
 ❌ No reverse engineering or decompilation
 
 ✅ Private use for personal/internal purposes only
@@ -134,35 +161,39 @@ This software and associated documentation files (the "Software") are proprietar
 
 This Software is licensed, not sold. You are granted a limited, non-exclusive, non-transferable, revocable license to use this Software solely for your personal, non-commercial purposes.
 
-For commercial licensing, partnerships, or other inquiries, please contact: [mabd8755@uni.sydney.edu.au]
+For commercial licensing, partnerships, or other inquiries, please contact:
+
+📧 [mabd8755@uni.sydney.edu.au](mailto:mabd8755@uni.sydney.edu.au)
+
+---
 
 ## Version History
 
 ### V4.0 (Current)
 
-- YOLOv8 + OpenVINO pipeline
-- Custom KIIT-MITA dataset
-- Raspberry Pi 5 optimized
-- Lightweight MJPEG streaming
-- ONNX → OpenVINO deployment
-- Changed streaming from flask to native HTTP server
+* YOLOv8 ONNX Runtime (CPU inference)
+* Precision vision-only servo tracking (pan/tilt)
+* Motion-aware target locking
+* PD-controlled servo movement with adaptive gains
+* Native MJPEG HTTP streaming server
+* Raspberry Pi 5 optimized
 
 ### V3.0
 
-- Added real-time streaming with web interface
-- Multi-client support with adaptive quality
-- Configuration management utility
-- Local testing system without Pi hardware
-- Professional dark theme UI
+* Added real-time streaming with web interface
+* Multi-client support with adaptive quality
+* Configuration management utility
+* Local testing system without Pi hardware
+* Professional dark theme UI
 
 ### V2.0
 
-- Added multithreaded processing
-- Implemented thermal management
-- Smart storage management with auto-cleanup
-- All 80 COCO classes support
-- Raspberry Pi optimizations
+* Added multithreaded processing
+* Implemented thermal management
+* Smart storage management with auto-cleanup
+* All 80 COCO classes support
+* Raspberry Pi optimizations
 
 ### V1.0
 
-- Intial release with basic object detection
+* Initial release with basic object detection
