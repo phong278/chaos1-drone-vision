@@ -26,3 +26,4 @@ models/
 *.pt
 *.bin
 *.xml
+*.onnx
