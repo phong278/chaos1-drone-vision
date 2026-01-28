@@ -126,6 +126,10 @@ frame_count = 0
 fps_start_time = time.time()
 current_fps = 0
 
+# Debug printing
+last_print_time = 0
+PRINT_INTERVAL = 0.5  # Print debug info every 0.5 seconds
+
 # ================= STREAMING =================
 STREAM_PORT = 5000
 stream_frame = None
@@ -297,6 +301,8 @@ while True:
     # Process tracking with PREDICTION
     should_move_motors = False
     tracked_center = None  # Store center of tracked person
+    current_gain = 0  # Initialize here so it's always defined
+    current_max_step = 0
     
     if person_box:
         x1, y1, x2, y2, conf = person_box
@@ -355,6 +361,23 @@ while True:
             status_text = "LOCKED - TRACKING"
             status_color = (0, 255, 0)  # Green when locked
         
+        # === SELECT GAIN BEFORE DEBUG PRINT ===
+        # Do this ONCE per frame, right after state machine
+        if tracking_state == STATE_CENTERING:
+            current_gain = GAIN_CENTERING
+            current_max_step = MAX_STEP
+        elif tracking_state == STATE_LOCKED:
+            current_gain = GAIN_LOCKED
+            current_max_step = MAX_STEP_LOCKED
+        else:
+            current_gain = GAIN_TRACKING
+            current_max_step = MAX_STEP
+        
+        # Distance-based gain scaling (expert improvement)
+        error_mag = np.sqrt(error_x**2 + error_y**2)
+        gain_scale = min(1.0, error_mag / 80.0)
+        effective_gain = current_gain * gain_scale
+        
         # === DRAW ALL DETECTED PEOPLE ===
         # First, draw all detections in gray (non-tracked people)
         for det in all_detections:
@@ -402,6 +425,40 @@ while True:
         cv2.putText(frame, f"Error: {int(abs(error_x))}px, {int(abs(error_y))}px", 
                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
         
+        # === DEBUG PRINTING ===
+        if now - last_print_time > PRINT_INTERVAL:
+            last_print_time = now
+            
+            # Calculate total error magnitude
+            total_error = np.sqrt(error_x**2 + error_y**2)
+            
+            print(f"\n{'='*60}")
+            print(f"TRACKING DIAGNOSTICS @ {time.strftime('%H:%M:%S')}")
+            print(f"{'='*60}")
+            print(f"State: {['SEARCHING', 'CENTERING', 'LOCKED'][tracking_state]}")
+            print(f"FPS: {current_fps:.1f} Hz")
+            print(f"\n--- POSITIONS ---")
+            print(f"Frame Center:    ({cx_frame}, {cy_frame})")
+            print(f"Raw Detection:   ({detected_x}, {detected_y})")
+            if smoothed_position:
+                print(f"Smoothed:        ({int(smooth_x)}, {int(smooth_y)})")
+            print(f"Predicted Target: ({target_x}, {target_y})")
+            print(f"\n--- ERRORS ---")
+            print(f"Error X: {error_x:+4d} px")
+            print(f"Error Y: {error_y:+4d} px")
+            print(f"Total Error: {total_error:.1f} px")
+            print(f"\n--- VELOCITY ---")
+            print(f"Velocity X: {vx:+6.1f} px/s")
+            print(f"Velocity Y: {vy:+6.1f} px/s")
+            print(f"\n--- CONTROL ---")
+            print(f"Should Move: {should_move_motors}")
+            print(f"Servo Pan:  {pan:+6.3f} ({pan*100:+6.1f}%)")
+            print(f"Servo Tilt: {tilt:+6.3f} ({tilt*100:+6.1f}%)")
+            print(f"Gain Used: {current_gain:.4f}")
+            print(f"Effective Gain: {effective_gain:.4f} (scaled by error)")
+            print(f"Max Step: {current_max_step:.3f}")
+            print(f"{'='*60}")
+        
         # Draw centering zone
         cv2.rectangle(frame, 
                      (cx_frame - CENTERING_THRESHOLD, cy_frame - CENTERING_THRESHOLD),
@@ -415,26 +472,16 @@ while True:
 
     # Update servo positions with DEADZONE
     if should_move_motors:
-        # Select gain based on state
-        if tracking_state == STATE_CENTERING:
-            gain = GAIN_CENTERING
-            max_step = MAX_STEP
-        elif tracking_state == STATE_LOCKED:
-            gain = GAIN_LOCKED
-            max_step = MAX_STEP_LOCKED
-        else:
-            gain = GAIN_TRACKING
-            max_step = MAX_STEP
-        
         current_time = time.time()
         dt = current_time - previous_time
         
-        # Calculate derivative
+        # Calculate derivative with TIGHTER clamping
         if GAIN_D > 0 and dt > 0 and dt < 0.5:
             derivative_x = (error_x - previous_error_x) / dt
             derivative_y = (error_y - previous_error_y) / dt
-            derivative_x = max(-150, min(150, derivative_x))
-            derivative_y = max(-150, min(150, derivative_y))
+            # Clamp harder to reduce fighting with prediction
+            derivative_x = max(-80, min(80, derivative_x))
+            derivative_y = max(-80, min(80, derivative_y))
         else:
             derivative_x = derivative_y = 0
         
@@ -442,19 +489,18 @@ while True:
         previous_error_y = error_y
         previous_time = current_time
         
-        # PD control WITH DEADZONE
-        # Note: Gains are tuned for ~0.1s update rate, dt scaling not needed for stable loop
+        # PD control WITH DEADZONE using effective_gain
         if abs(error_x) > DEADZONE:
-            p_term_x = error_x * gain
+            p_term_x = error_x * effective_gain  # Use scaled gain
             d_term_x = -derivative_x * GAIN_D
             correction_x = p_term_x + d_term_x
-            pan += max(-max_step, min(max_step, correction_x))
+            pan += max(-current_max_step, min(current_max_step, correction_x))
         
         if abs(error_y) > DEADZONE:
-            p_term_y = error_y * gain
+            p_term_y = error_y * effective_gain  # Use scaled gain
             d_term_y = -derivative_y * GAIN_D
             correction_y = p_term_y + d_term_y
-            tilt += max(-max_step, min(max_step, correction_y))
+            tilt += max(-current_max_step, min(current_max_step, correction_y))
     
     # Clamp servo values
     pan = max(-1.0, min(1.0, pan))
