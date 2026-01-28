@@ -28,14 +28,16 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 424)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
 # ================= YOLOv8 ONNX =================
-MODEL_PATH = "yolov8n.onnx"
+MODEL_PATH = "yolov8n.onnx"  # Change to your military model
 YOLO_CONF = 0.4
 YOLO_INTERVAL = 0.10  # 10 Hz detection
 PERSON_TIMEOUT = 1.0
 
-# YOLO Export Command (for reference):
-# yolo export model=yolov8n.pt format=onnx imgsz=640 simplify=True
-# Expected output shape: [1, 84, 8400] where 84 = [cx, cy, w, h, 80 classes]
+# ===== CUSTOM MODEL CONFIGURATION =====
+TARGET_CLASS_ID = 5  # Class ID to track (0 for person in COCO)
+
+
+NUM_CLASSES = 9  
 
 sess = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
 yolo_input = sess.get_inputs()[0].name
@@ -43,7 +45,7 @@ yolo_output_shape = sess.get_outputs()[0].shape  # Store for validation
 
 last_yolo_time = 0
 last_person_time = 0
-person_box = None
+person_box = None  # Note: "person_box" variable name kept for simplicity, but tracks any TARGET_CLASS_ID
 
 # ================= VELOCITY PREDICTION =================
 # Track smoothed position and velocity (not raw YOLO)
@@ -107,19 +109,24 @@ previous_error_y = 0
 previous_time = time.time()
 
 # Separated gains for different states
-GAIN_CENTERING = 0.007   # Fast initial lock
-GAIN_TRACKING = 0.006    # Moderate tracking
-GAIN_LOCKED = 0.004      # Gentle corrections when locked
+GAIN_CENTERING = 0.005   # Fast initial lock
+GAIN_TRACKING = 0.004    # Moderate tracking
+GAIN_LOCKED = 0.002      # Gentle corrections when locked
 
-GAIN_D = 0.03  # Moderate damping
+GAIN_D = 0.035  # Moderate damping
 
 # CRITICAL: Deadzone to avoid chasing noise
 DEADZONE = 8  # Pixels - ignore small errors to prevent servo buzz
 
 # Thresholds
 CENTERING_THRESHOLD = 18
-MAX_STEP = 0.045
-MAX_STEP_LOCKED = 0.035  # Slower when locked
+MAX_STEP = 0.035
+MAX_STEP_LOCKED = 0.025  # Slower when locked
+
+# FPS tracking
+frame_count = 0
+fps_start_time = time.time()
+current_fps = 0
 
 # ================= STREAMING =================
 STREAM_PORT = 5000
@@ -178,21 +185,24 @@ def run_yolo(frame):
     output = np.squeeze(output)
     
     # VALIDATION: Check output shape
-    # Expected: [84, 8400] for YOLOv8 (4 box coords + 80 classes)
-    if output.shape[0] not in [84, 85]:  # Some exports have 85
+    # Expected: [4 + NUM_CLASSES, N] for YOLOv8
+    expected_channels = 4 + NUM_CLASSES
+    if output.shape[0] != expected_channels and output.shape[0] != expected_channels + 1:
         print(f"⚠️ WARNING: Unexpected YOLO output shape: {output.shape}")
-        print(f"Expected [84 or 85, N]. Check export command.")
+        print(f"Expected [{expected_channels} or {expected_channels + 1}, N]")
+        print(f"Got [{output.shape[0]}, {output.shape[1]}]")
+        print(f"Check NUM_CLASSES setting (currently {NUM_CLASSES})")
 
     boxes = output[:4, :]  # [cx, cy, w, h]
-    scores = output[4:, :]  # [80 class scores]
+    scores = output[4:, :]  # [NUM_CLASSES class scores]
 
     class_ids = np.argmax(scores, axis=0)
     confidences = scores[class_ids, np.arange(scores.shape[1])]
 
-    # Collect ALL person detections (class 0 = person in COCO)
+    # Collect ALL target detections (using TARGET_CLASS_ID)
     detections = []
     for i in range(scores.shape[1]):
-        if class_ids[i] == 0 and confidences[i] > YOLO_CONF:
+        if class_ids[i] == TARGET_CLASS_ID and confidences[i] > YOLO_CONF:
             cx, cy, bw, bh = boxes[:, i]
             x1 = int((cx - bw / 2) * w)
             y1 = int((cy - bh / 2) * h)
