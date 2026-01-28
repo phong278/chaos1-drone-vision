@@ -49,9 +49,9 @@ person_box = None
 # Track smoothed position and velocity (not raw YOLO)
 smoothed_position = None
 smoothed_velocity = (0, 0)
-position_smoothing = 0.3  # EMA smoothing factor
-velocity_smoothing = 0.5  # EMA smoothing factor
-predicted_latency = 0.15  # System latency estimate (150ms)
+position_smoothing = 0.5   # HIGHER = more responsive, less lag (was 0.15)
+velocity_smoothing = 0.6   # HIGHER = faster velocity tracking (was 0.3)
+predicted_latency = 0.15   # System latency estimate (150ms)
 
 def estimate_velocity():
     """Return current smoothed velocity"""
@@ -107,19 +107,24 @@ previous_error_y = 0
 previous_time = time.time()
 
 # Separated gains for different states
-GAIN_CENTERING = 0.007   # Fast initial lock
-GAIN_TRACKING = 0.006    # Moderate tracking
-GAIN_LOCKED = 0.004      # Gentle corrections when locked
+GAIN_CENTERING = 0.005   # Fast initial lock
+GAIN_TRACKING = 0.004    # Moderate tracking
+GAIN_LOCKED = 0.002      # Gentle corrections when locked
 
-GAIN_D = 0.03  # Moderate damping
+GAIN_D = 0.035  # Moderate damping
 
 # CRITICAL: Deadzone to avoid chasing noise
-DEADZONE = 8  # Pixels - ignore small errors to prevent servo buzz
+DEADZONE = 3  # REDUCED - allows continuous fine adjustments (was 8)
 
 # Thresholds
 CENTERING_THRESHOLD = 18
-MAX_STEP = 0.045
-MAX_STEP_LOCKED = 0.035  # Slower when locked
+MAX_STEP = 0.035
+MAX_STEP_LOCKED = 0.025  # Slower when locked
+
+# FPS tracking
+frame_count = 0
+fps_start_time = time.time()
+current_fps = 0
 
 # ================= STREAMING =================
 STREAM_PORT = 5000
@@ -250,9 +255,11 @@ while True:
     now = time.time()
 
     # Run YOLO detection periodically
+    all_detections = []  # Store all detections for visualization
     if now - last_yolo_time > YOLO_INTERVAL:
         last_yolo_time = now
         detections = run_yolo(frame)
+        all_detections = detections  # Keep for drawing
         
         current_target_pos = None
         if person_box:
@@ -289,11 +296,13 @@ while True:
 
     # Process tracking with PREDICTION
     should_move_motors = False
+    tracked_center = None  # Store center of tracked person
     
     if person_box:
         x1, y1, x2, y2, conf = person_box
         detected_x = (x1 + x2) // 2
         detected_y = (y1 + y2) // 2
+        tracked_center = (detected_x, detected_y)  # For comparison later
         
         # Update smoothed position and velocity
         if last_position_time is not None:
@@ -340,34 +349,58 @@ while True:
                 status_color = (0, 165, 255)
                 
         elif tracking_state == STATE_LOCKED:
-            # Move if significantly off-center
-            if not is_centered(error_x, error_y):
-                should_move_motors = True
-                status_text = "LOCKED - TRACKING"
-                status_color = (0, 255, 255)
-            else:
-                should_move_motors = False
-                status_text = "LOCKED - STEADY"
-                status_color = (0, 255, 0)
+            # ALWAYS track when locked - no more "steady" state
+            # This ensures continuous centering even with jitter
+            should_move_motors = True
+            status_text = "LOCKED - TRACKING"
+            status_color = (0, 255, 0)  # Green when locked
         
-        # Draw detection box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), status_color, 2)
-        cv2.putText(frame, f"{status_text} {conf:.2f}",
+        # === DRAW ALL DETECTED PEOPLE ===
+        # First, draw all detections in gray (non-tracked people)
+        for det in all_detections:
+            det_center = det['center']
+            # Check if this is the tracked person
+            is_tracked = (tracked_center and 
+                         abs(det_center[0] - tracked_center[0]) < 10 and
+                         abs(det_center[1] - tracked_center[1]) < 10)
+            
+            if not is_tracked:
+                # Draw non-tracked people in gray
+                dx1, dy1, dx2, dy2 = det['box']
+                cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (128, 128, 128), 2)
+                cv2.putText(frame, f"PERSON {det['conf']:.2f}",
+                           (dx1, dy1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+        
+        # Then draw tracked person in color (on top)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), status_color, 3)  # Thicker border
+        cv2.putText(frame, f"TRACKING: {status_text} {conf:.2f}",
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
         
         # Draw detected center (blue)
         cv2.circle(frame, (detected_x, detected_y), 5, (255, 0, 0), -1)
+        cv2.putText(frame, "RAW", (detected_x + 8, detected_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 0), 1)
         
         # Draw smoothed position (cyan)
         if smoothed_position:
             smooth_x, smooth_y = int(smoothed_position[0]), int(smoothed_position[1])
             cv2.circle(frame, (smooth_x, smooth_y), 5, (255, 255, 0), -1)
+            cv2.putText(frame, "SMOOTH", (smooth_x + 8, smooth_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
         
         # Draw predicted center (green) - where we're actually tracking
         if smoothed_position and (abs(vx) > 1 or abs(vy) > 1):
             cv2.circle(frame, (target_x, target_y), 5, (0, 255, 0), -1)
             cv2.line(frame, (smooth_x, smooth_y), (target_x, target_y), (0, 255, 0), 2)
+            cv2.putText(frame, "PREDICT", (target_x + 8, target_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+        
+        # Draw error visualization - line from target to frame center
+        cv2.line(frame, (target_x, target_y), (cx_frame, cy_frame), (255, 0, 255), 2)
+        cv2.putText(frame, f"Error: {int(abs(error_x))}px, {int(abs(error_y))}px", 
+                   (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
         
         # Draw centering zone
         cv2.rectangle(frame, 
@@ -434,6 +467,16 @@ while True:
     # Draw center crosshair
     cv2.line(frame, (cx_frame - 10, cy_frame), (cx_frame + 10, cy_frame), (255, 255, 255), 1)
     cv2.line(frame, (cx_frame, cy_frame - 10), (cx_frame, cy_frame + 10), (255, 255, 255), 1)
+
+    # FPS counter
+    frame_count += 1
+    if now - fps_start_time > 1.0:
+        current_fps = frame_count / (now - fps_start_time)
+        frame_count = 0
+        fps_start_time = now
+    
+    cv2.putText(frame, f"FPS: {current_fps:.1f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     with stream_lock:
         stream_frame = frame.copy()
