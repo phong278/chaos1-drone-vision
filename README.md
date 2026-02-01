@@ -138,6 +138,23 @@ All datasets were converted to YOLO format, unified under a single class mapping
 
 ---
 
+## Requirements 🔧
+
+* Python 3.10+ (3.11 recommended)
+* See `linux/requirementsPI.txt` for exact dependencies (e.g. `onnxruntime`, `opencv-python`, `numpy`, `gpiozero`, `lgpio`)
+
+## Quick Start ✅
+
+1. Install dependencies: `pip install -r linux/requirementsPI.txt`
+2. Run the detector and tracker: `python3 linux/detection.py`
+3. View the stream in a browser: `http://<pi-ip>:5000`
+
+Optional examples:
+* `python3 linux/detect_video.py --source /dev/video0`
+* `python3 linux/detect_images.py --source dataset/test/images`
+
+---
+
 ## License & Intellectual Property
 
 Copyright © 2025 Muhammad Abdullah and Phong Ngo.
@@ -169,7 +186,13 @@ For commercial licensing, partnerships, or other inquiries, please contact:
 
 ## Version History
 
-### V4.0 (Current)
+### V4.5 (Current)
+
+* Documentation and quick-start additions for easier setup
+* Minor tracking & stability tuning (conservative predictive trust, damping, deadzone)
+* Safer servo defaults and clearer debug/status output
+
+### V4.0 (Previous)
 
 * YOLOv8 ONNX Runtime (CPU inference)
 * Precision vision-only servo tracking (pan/tilt)
